@@ -185,6 +185,13 @@ export function createMessageTransformer({
   }
 }
 
+/** Heuristic for an OAuth/401-class error coming back from the remote side. */
+function isLikelyAuthError(error: Error): boolean {
+  if (error instanceof UnauthorizedError) return true
+  const msg = error?.message ?? ''
+  return /unauthorized|\b401\b/i.test(msg)
+}
+
 /**
  * Creates a bidirectional proxy between two transports
  * @param params The transport connections to proxy between
@@ -193,13 +200,24 @@ export function mcpProxy({
   transportToClient,
   transportToServer,
   ignoredTools = [],
+  onAuthError,
 }: {
   transportToClient: Transport
   transportToServer: Transport
   ignoredTools?: string[]
+  /**
+   * Optional handler invoked when the remote transport reports an auth-class
+   * error mid-session (UnauthorizedError or a 401-shaped message). The handler
+   * owns the recovery: closing the dead transport, re-running the OAuth flow,
+   * and calling mcpProxy() again with the new transport. While this handler is
+   * in flight we suppress the "remote closed → close local" cascade so the
+   * stdio side stays connected for the swap.
+   */
+  onAuthError?: (error: Error) => void | Promise<void>
 }) {
   let transportToClientClosed = false
   let transportToServerClosed = false
+  let recoveringFromAuthError = false
 
   const messageTransformer = createMessageTransformer({
     transformRequestFunction: (request: Message) => {
@@ -295,6 +313,12 @@ export function mcpProxy({
       return
     }
     transportToServerClosed = true
+    if (recoveringFromAuthError) {
+      // The auth-error handler is swapping the remote transport. Don't tear
+      // down the local stdio pipe — the new transport will be wired up shortly.
+      debugLog('Remote transport closed during auth recovery; keeping local transport open for swap')
+      return
+    }
     debugLog('Remote transport closed, closing local transport')
     transportToClient.close().catch(onClientError)
   }
@@ -310,6 +334,19 @@ export function mcpProxy({
   function onServerError(error: Error) {
     log('Error from remote server:', error)
     debugLog('Error from remote server', { stack: error.stack })
+
+    // Dispatch auth-class errors to the recovery handler if one was provided.
+    // The handler is responsible for the actual reconnect; we just flip the
+    // suppression flag so the imminent transport close doesn't drag down stdio.
+    if (onAuthError && !recoveringFromAuthError && isLikelyAuthError(error)) {
+      recoveringFromAuthError = true
+      Promise.resolve()
+        .then(() => onAuthError(error))
+        .catch((handlerError) => {
+          log('onAuthError handler threw:', handlerError)
+          debugLog('onAuthError handler error', { stack: (handlerError as Error)?.stack })
+        })
+    }
   }
 }
 

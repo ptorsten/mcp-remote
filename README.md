@@ -227,6 +227,8 @@ Each unique combination of server URL, resource, and custom headers will maintai
       ]
 ```
 
+  **In-process re-auth.** If the remote MCP server reports `401 Unauthorized` mid-session (e.g. the access token expired and refresh failed), `mcp-remote` does not exit. It closes the dead transport, resets the OAuth coordinator, drops stored tokens, and runs the OAuth flow again — which re-fires `--pre-listen-hook` and `--post-auth-hook` and registers a fresh callback listener. The new remote transport is swapped into the proxy without closing the stdio pipe, so your MCP client stays connected. In-flight requests on the dead transport are lost; the client is expected to retry them on its own.
+
   Two example scripts ship with the repository:
 
   - [`examples/nginx-callback-proxy-hook.sh`](examples/nginx-callback-proxy-hook.sh) — writes an nginx `location` snippet into an included directory and reloads nginx.

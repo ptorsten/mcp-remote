@@ -118,24 +118,71 @@ async function runProxy(
 
   try {
     // Connect to remote server with lazy authentication
-    const remoteTransport = await connectToRemoteServer(null, serverUrl, authProvider, headers, authInitializer, transportStrategy)
+    let currentRemoteTransport = await connectToRemoteServer(null, serverUrl, authProvider, headers, authInitializer, transportStrategy)
+
+    // Mid-session re-auth: if the remote transport reports a 401 / Unauthorized,
+    // tear it down, reset the auth coordinator (so --pre-listen-hook re-fires
+    // and a fresh `once` listener is registered for --post-auth-hook), drop the
+    // stored tokens, and reconnect via the same connectToRemoteServer code path
+    // that handled initial auth. The new transport is swapped into the proxy
+    // without closing the local stdio pipe.
+    const handleAuthError = async (error: Error): Promise<void> => {
+      log('Mid-session auth error detected; attempting re-auth')
+      debugLog('Mid-session auth error', { message: error.message, stack: error.stack })
+
+      const dead = currentRemoteTransport
+      // Detach handlers synchronously so the in-flight close from the dead
+      // transport doesn't reach mcpProxy and trip the recovery flag twice.
+      dead.onclose = undefined
+      dead.onerror = undefined
+      dead.onmessage = undefined
+      await dead.close().catch(() => {})
+
+      try {
+        await authCoordinator.resetForReAuth()
+        await authProvider.invalidateCredentials('tokens')
+
+        currentRemoteTransport = await connectToRemoteServer(null, serverUrl, authProvider, headers, authInitializer, transportStrategy)
+
+        // Re-wire the proxy on top of the existing local transport. The fresh
+        // call also re-arms onAuthError for the next failure.
+        mcpProxy({
+          transportToClient: localTransport,
+          transportToServer: currentRemoteTransport,
+          ignoredTools,
+          onAuthError: handleAuthError,
+        })
+
+        log(`Re-auth complete; proxy resumed using ${currentRemoteTransport.constructor.name}`)
+      } catch (reAuthError) {
+        log('Re-auth failed; closing connection:', reAuthError)
+        debugLog('Re-auth error', reAuthError)
+        try {
+          await localTransport.close()
+        } catch {
+          // best-effort cleanup
+        }
+        process.exit(1)
+      }
+    }
 
     // Set up bidirectional proxy between local and remote transports
     mcpProxy({
       transportToClient: localTransport,
-      transportToServer: remoteTransport,
+      transportToServer: currentRemoteTransport,
       ignoredTools,
+      onAuthError: handleAuthError,
     })
 
     // Start the local STDIO server
     await localTransport.start()
     log('Local STDIO server running')
-    log(`Proxy established successfully between local STDIO and remote ${remoteTransport.constructor.name}`)
+    log(`Proxy established successfully between local STDIO and remote ${currentRemoteTransport.constructor.name}`)
     log('Press Ctrl+C to exit')
 
     // Setup cleanup handler
     const cleanup = async () => {
-      await remoteTransport.close()
+      await currentRemoteTransport.close()
       await localTransport.close()
       // Only close the server if it was initialized
       if (server) {

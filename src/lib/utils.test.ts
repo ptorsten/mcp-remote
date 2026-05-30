@@ -1137,6 +1137,155 @@ describe('Feature: MCP Proxy', () => {
       }),
     )
   })
+
+  it('Scenario: onAuthError fires for UnauthorizedError-shaped server errors', async () => {
+    // Given a proxy with an onAuthError handler
+    const mockTransportToClient = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+    const mockTransportToServer = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+    const onAuthError = vi.fn().mockResolvedValue(undefined)
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: [],
+      onAuthError,
+    })
+
+    // When the remote transport reports an Unauthorized-shaped error
+    if (mockTransportToServer.onerror) {
+      mockTransportToServer.onerror(new Error('HTTP 401 Unauthorized'))
+    }
+
+    // Then onAuthError is dispatched (after the microtask tick)
+    await new Promise((resolve) => setImmediate(resolve))
+    expect(onAuthError).toHaveBeenCalledTimes(1)
+    expect(onAuthError).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('Unauthorized') }))
+  })
+
+  it('Scenario: onAuthError is not called for non-auth errors', async () => {
+    // Given a proxy with an onAuthError handler
+    const mockTransportToClient = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+    const mockTransportToServer = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+    const onAuthError = vi.fn().mockResolvedValue(undefined)
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: [],
+      onAuthError,
+    })
+
+    // When the remote transport reports a non-auth error (e.g. transient network)
+    if (mockTransportToServer.onerror) {
+      mockTransportToServer.onerror(new Error('SSE stream disconnected: TypeError: terminated'))
+    }
+
+    // Then onAuthError is not called
+    await new Promise((resolve) => setImmediate(resolve))
+    expect(onAuthError).not.toHaveBeenCalled()
+  })
+
+  it('Scenario: local transport is kept open while onAuthError handler runs', async () => {
+    // Given a proxy with an onAuthError handler
+    const mockTransportToClient = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+    const mockTransportToServer = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+    const onAuthError = vi.fn().mockResolvedValue(undefined)
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: [],
+      onAuthError,
+    })
+
+    // When the remote transport errors with auth then closes
+    if (mockTransportToServer.onerror) {
+      mockTransportToServer.onerror(new Error('Unauthorized'))
+    }
+    if (mockTransportToServer.onclose) {
+      mockTransportToServer.onclose()
+    }
+
+    // Then the local transport is NOT closed — the handler owns the swap
+    await new Promise((resolve) => setImmediate(resolve))
+    expect(mockTransportToClient.close).not.toHaveBeenCalled()
+  })
+
+  it('Scenario: without onAuthError, server-close still closes local transport', async () => {
+    // Given a proxy with NO onAuthError handler (legacy behavior)
+    const mockTransportToClient = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+    const mockTransportToServer = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: [],
+    })
+
+    // When the server transport closes (e.g. after an unhandled auth error)
+    if (mockTransportToServer.onclose) {
+      mockTransportToServer.onclose()
+    }
+
+    // Then the local transport is closed (preserves prior behavior)
+    expect(mockTransportToClient.close).toHaveBeenCalled()
+  })
 })
 
 describe('setupOAuthCallbackServerWithLongPoll', () => {

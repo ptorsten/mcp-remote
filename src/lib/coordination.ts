@@ -14,6 +14,14 @@ export interface CoordinationHooks {
 
 export type AuthCoordinator = {
   initializeAuth: () => Promise<{ server: Server; waitForAuthCode: () => Promise<string>; skipBrowserAuth: boolean }>
+  /**
+   * Tears down the cached auth state (closes the OAuth callback listener,
+   * removes the lockfile, clears the cached promise of the auth code) so the
+   * next `initializeAuth` call starts a fresh flow. Used by mid-session
+   * re-auth, where the previous authorization code is already consumed and we
+   * need new pre-listen/post-auth hook invocations.
+   */
+  resetForReAuth: () => Promise<void>
 }
 
 /**
@@ -161,6 +169,25 @@ export function createLazyAuthCoordinator(
       authState = await coordinateAuth(serverUrlHash, port, events, authTimeoutMs, callbackPath, hooks)
       debugLog('Auth coordination completed', { skipBrowserAuth: authState.skipBrowserAuth })
       return authState
+    },
+    resetForReAuth: async () => {
+      if (!authState) {
+        debugLog('resetForReAuth called but no auth state to reset')
+        return
+      }
+      log('Resetting auth coordinator for mid-session re-auth')
+      const previous = authState
+      authState = null
+
+      // Close the OAuth callback listener so the next initializeAuth call binds
+      // a fresh one (which re-runs --pre-listen-hook and registers a fresh
+      // post-auth listener — the prior `once` listener was already consumed).
+      await new Promise<void>((resolve) => {
+        previous.server.close(() => resolve())
+      })
+      await deleteLockfile(serverUrlHash).catch((err) => {
+        debugLog('Error deleting lockfile during reset', err)
+      })
     },
   }
 }
