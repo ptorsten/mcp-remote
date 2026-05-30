@@ -15,6 +15,7 @@ import {
   connectToRemoteServer,
   log,
   debugLog,
+  logStartupTokenState,
   mcpProxy,
   parseCommandLineArgs,
   setupSignalHandlers,
@@ -88,6 +89,12 @@ async function runProxy(
     protectedResourceMetadata: discoveryResult.protectedResourceMetadata,
     wwwAuthenticateScope: discoveryResult.wwwAuthenticateScope,
   })
+
+  // Visibility: report what OAuth credentials we already have on disk so the
+  // user can tell whether a silent refresh path is even possible. We never
+  // delete tokens on startup, so unless the server has revoked them this
+  // restart should be transparent.
+  await logStartupTokenState(authProvider, serverUrl)
 
   // Create the STDIO transport for local connections
   const localTransport = new StdioServerTransport()

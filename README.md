@@ -235,6 +235,14 @@ Each unique combination of server URL, resource, and custom headers will maintai
   OAuth tokens saved. Access token expires in 1.0h (at 5/30/2026, 6:42:11 PM). Refresh token: present.
   ```
 
+  On startup, `mcp-remote` also logs what's already on disk so you can tell whether a silent refresh path is possible without enabling `--debug`:
+
+  ```
+  Existing OAuth tokens loaded for https://example.remote/sse — 47m remaining, refresh token present (silent refresh will be attempted if needed).
+  ```
+
+  Remaining lifetime is computed from a sibling `issued_at` timestamp that `mcp-remote` writes alongside the OAuth fields in `tokens.json`. Tokens saved by older `mcp-remote` releases (no `issued_at` field) will show "remaining lifetime unknown" until they're next refreshed. Tokens are never wiped at startup — a restart always tries the existing access token first, then a silent refresh-token exchange, before falling through to the browser-based OAuth flow.
+
   Run with `--debug` for the full token payload in `~/.mcp-auth/<hash>_debug.log`.
 
   Two example scripts ship with the repository:

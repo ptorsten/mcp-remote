@@ -18,6 +18,7 @@ import {
   setupSignalHandlers,
   log,
   debugLog,
+  logStartupTokenState,
   MCP_REMOTE_VERSION,
   connectToRemoteServer,
   TransportStrategy,
@@ -86,6 +87,9 @@ async function runClient(
     protectedResourceMetadata: discoveryResult.protectedResourceMetadata,
     wwwAuthenticateScope: discoveryResult.wwwAuthenticateScope,
   })
+
+  // Visibility: log what OAuth credentials we have on disk before connecting.
+  await logStartupTokenState(authProvider, serverUrl)
 
   // Create the client
   const client = new Client(

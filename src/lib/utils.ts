@@ -185,6 +185,46 @@ export function createMessageTransformer({
   }
 }
 
+/**
+ * Logs a user-visible summary of what OAuth credentials are on disk at startup.
+ * Helps the user see whether a silent refresh will be attempted vs. whether a
+ * full browser-based OAuth flow will be needed. Best-effort — failures here
+ * never block startup.
+ */
+export async function logStartupTokenState(
+  authProvider: {
+    tokens(): Promise<{ access_token?: string; expires_in?: number; refresh_token?: string } | undefined>
+    accessTokenRemainingSeconds?(): Promise<number | undefined>
+  },
+  serverUrl: string,
+): Promise<void> {
+  try {
+    const existing = await authProvider.tokens()
+    if (!existing?.access_token) {
+      log(`No existing OAuth tokens for ${serverUrl}; will run the OAuth flow if the server requires auth.`)
+      return
+    }
+
+    const remaining = await authProvider.accessTokenRemainingSeconds?.()
+    const lifetimeBlurb = remaining !== undefined ? `${formatLifetime(remaining)} remaining` : 'remaining lifetime unknown'
+    const refreshBlurb = existing.refresh_token
+      ? 'refresh token present (silent refresh will be attempted if needed)'
+      : 'no refresh token (browser auth needed if access token has expired)'
+    log(`Existing OAuth tokens loaded for ${serverUrl} — ${lifetimeBlurb}, ${refreshBlurb}.`)
+  } catch (error) {
+    debugLog('Failed to log startup token state', error)
+  }
+}
+
+/** Formats a duration in seconds as a compact human-readable string. */
+export function formatLifetime(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return 'unknown'
+  if (seconds < 60) return `${Math.round(seconds)}s`
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m`
+  if (seconds < 86400) return `${(seconds / 3600).toFixed(1)}h`
+  return `${(seconds / 86400).toFixed(1)}d`
+}
+
 /** Heuristic for an OAuth/401-class error coming back from the remote side. */
 function isLikelyAuthError(error: Error): boolean {
   if (error instanceof UnauthorizedError) return true

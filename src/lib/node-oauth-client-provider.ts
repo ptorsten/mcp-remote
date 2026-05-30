@@ -7,20 +7,13 @@ import {
   OAuthTokensSchema,
 } from '@modelcontextprotocol/sdk/shared/auth.js'
 import type { OAuthProviderOptions, StaticOAuthClientMetadata } from './types'
-import { readJsonFile, writeJsonFile, readTextFile, writeTextFile, deleteConfigFile } from './mcp-auth-config'
+import { readJsonFile, readRawJsonFile, writeJsonFile, readTextFile, writeTextFile, deleteConfigFile } from './mcp-auth-config'
 import { StaticOAuthClientInformationFull } from './types'
-import { log, debugLog, MCP_REMOTE_VERSION } from './utils'
+import { formatLifetime, log, debugLog, MCP_REMOTE_VERSION } from './utils'
 import { sanitizeUrl } from 'strict-url-sanitise'
 import { randomUUID } from 'node:crypto'
 import { fetchAuthorizationServerMetadata, type AuthorizationServerMetadata } from './authorization-server-metadata'
 import type { ProtectedResourceMetadata } from './protected-resource-metadata'
-
-function formatLifetime(seconds: number): string {
-  if (seconds < 60) return `${seconds}s`
-  if (seconds < 3600) return `${Math.round(seconds / 60)}m`
-  if (seconds < 86400) return `${(seconds / 3600).toFixed(1)}h`
-  return `${(seconds / 86400).toFixed(1)}d`
-}
 
 /**
  * Implements the OAuthClientProvider interface for Node.js environments.
@@ -42,6 +35,11 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   private authorizationServerMetadata: AuthorizationServerMetadata | undefined
   private protectedResourceMetadata: ProtectedResourceMetadata | undefined
   private wwwAuthenticateScope: string | undefined
+  // Millis since epoch when the current tokens.json was last written. The MCP
+  // SDK's OAuthTokens type doesn't carry this, so we persist it as a sibling
+  // field in the JSON file and read it via readRawJsonFile to avoid the SDK's
+  // strict-by-default schema stripping it.
+  private _tokensIssuedAt: number | undefined
 
   /**
    * Creates a new NodeOAuthClientProvider
@@ -205,33 +203,68 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     debugLog('Reading OAuth tokens')
     debugLog('Token request stack trace:', new Error().stack)
 
-    const tokens = await readJsonFile<OAuthTokens>(this.serverUrlHash, 'tokens.json', OAuthTokensSchema)
-
-    if (tokens) {
-      const timeLeft = tokens.expires_in || 0
-
-      // Alert if expires_in is invalid
-      if (typeof tokens.expires_in !== 'number' || tokens.expires_in < 0) {
-        debugLog('⚠️ WARNING: Invalid expires_in detected while reading tokens ⚠️', {
-          expiresIn: tokens.expires_in,
-          tokenObject: JSON.stringify(tokens),
-          stack: new Error('Invalid expires_in value').stack,
-        })
-      }
-
-      debugLog('Token result:', {
-        found: true,
-        hasAccessToken: !!tokens.access_token,
-        hasRefreshToken: !!tokens.refresh_token,
-        expiresIn: `${timeLeft} seconds`,
-        isExpired: timeLeft <= 0,
-        expiresInValue: tokens.expires_in,
-      })
-    } else {
+    // Read the JSON raw so we don't lose our sibling `issued_at` field to the
+    // SDK schema's default strip behavior.
+    const raw = (await readRawJsonFile(this.serverUrlHash, 'tokens.json')) as Record<string, unknown> | undefined
+    if (!raw) {
       debugLog('Token result: Not found')
+      this._tokensIssuedAt = undefined
+      return undefined
     }
 
+    this._tokensIssuedAt = typeof raw.issued_at === 'number' ? (raw.issued_at as number) : undefined
+
+    let tokens: OAuthTokens
+    try {
+      tokens = await OAuthTokensSchema.parseAsync(raw)
+    } catch (error) {
+      debugLog('Token schema validation failed', error)
+      return undefined
+    }
+
+    const timeLeft = tokens.expires_in || 0
+    if (typeof tokens.expires_in !== 'number' || tokens.expires_in < 0) {
+      debugLog('⚠️ WARNING: Invalid expires_in detected while reading tokens ⚠️', {
+        expiresIn: tokens.expires_in,
+        tokenObject: JSON.stringify(tokens),
+        stack: new Error('Invalid expires_in value').stack,
+      })
+    }
+
+    debugLog('Token result:', {
+      found: true,
+      hasAccessToken: !!tokens.access_token,
+      hasRefreshToken: !!tokens.refresh_token,
+      expiresIn: `${timeLeft} seconds`,
+      isExpired: timeLeft <= 0,
+      expiresInValue: tokens.expires_in,
+      issuedAt: this._tokensIssuedAt,
+    })
+
     return tokens
+  }
+
+  /**
+   * Returns the wall-clock millisecond timestamp that the current tokens were
+   * last written to disk, or undefined if no tokens exist (or were written by
+   * an older mcp-remote that didn't stamp them).
+   */
+  tokensIssuedAt(): number | undefined {
+    return this._tokensIssuedAt
+  }
+
+  /**
+   * Computes the remaining lifetime (in seconds) of the saved access token,
+   * based on the stored `issued_at` timestamp and `expires_in`. Returns
+   * undefined if we don't have enough information to compute it (no tokens,
+   * no `expires_in`, or no `issued_at` — e.g. tokens written by an older
+   * mcp-remote release).
+   */
+  async accessTokenRemainingSeconds(): Promise<number | undefined> {
+    const tokens = await this.tokens()
+    if (!tokens?.expires_in || !this._tokensIssuedAt) return undefined
+    const elapsedSec = (Date.now() - this._tokensIssuedAt) / 1000
+    return Math.max(0, tokens.expires_in - elapsedSec)
   }
 
   /**
@@ -240,6 +273,8 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
    */
   async saveTokens(tokens: OAuthTokens): Promise<void> {
     const timeLeft = tokens.expires_in || 0
+    const issuedAt = Date.now()
+    this._tokensIssuedAt = issuedAt
 
     // Alert if expires_in is invalid
     if (typeof tokens.expires_in !== 'number' || tokens.expires_in < 0) {
@@ -255,7 +290,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     // re-auth. Lets the user see when the access token will expire without
     // turning on --debug.
     if (timeLeft > 0) {
-      const expiresAt = new Date(Date.now() + timeLeft * 1000)
+      const expiresAt = new Date(issuedAt + timeLeft * 1000)
       log(
         `OAuth tokens saved. Access token expires in ${formatLifetime(timeLeft)} (at ${expiresAt.toLocaleString()}). ` +
           `Refresh token: ${tokens.refresh_token ? 'present' : 'none'}.`,
@@ -269,9 +304,13 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       hasRefreshToken: !!tokens.refresh_token,
       expiresIn: `${timeLeft} seconds`,
       expiresInValue: tokens.expires_in,
+      issuedAt,
     })
 
-    await writeJsonFile(this.serverUrlHash, 'tokens.json', tokens)
+    // Persist tokens alongside our `issued_at` sibling. The SDK ignores extras
+    // when it re-validates via OAuthTokensSchema, but our `tokens()` reader
+    // pulls issued_at out separately via readRawJsonFile.
+    await writeJsonFile(this.serverUrlHash, 'tokens.json', { ...tokens, issued_at: issuedAt })
   }
 
   /**

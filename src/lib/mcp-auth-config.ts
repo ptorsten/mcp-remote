@@ -155,6 +155,26 @@ export async function readJsonFile<T>(serverUrlHash: string, filename: string, s
 }
 
 /**
+ * Reads a JSON file without schema validation. Useful when we want to preserve
+ * fields that the SDK's strict-by-default schema would strip (e.g., our
+ * `issued_at` annotation on tokens.json).
+ */
+export async function readRawJsonFile(serverUrlHash: string, filename: string): Promise<unknown | undefined> {
+  try {
+    await ensureConfigDir()
+    const filePath = getConfigFilePath(serverUrlHash, filename)
+    const content = await fs.readFile(filePath, 'utf-8')
+    return JSON.parse(content)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return undefined
+    }
+    log(`Error reading ${filename} (raw):`, error)
+    return undefined
+  }
+}
+
+/**
  * Writes a JSON object to a file
  * @param serverUrlHash The hash of the server URL
  * @param filename The name of the file to write
