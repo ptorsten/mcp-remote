@@ -131,6 +131,50 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
     })
   })
 
+  describe('redirectUrl', () => {
+    it('defaults to http and includes the callback port', () => {
+      provider = new NodeOAuthClientProvider(defaultOptions)
+      expect(provider.redirectUrl).toBe('http://localhost:8080/oauth/callback')
+    })
+
+    it('honors --callback-scheme https', () => {
+      provider = new NodeOAuthClientProvider({
+        ...defaultOptions,
+        callbackScheme: 'https',
+        callbackPort: 8443,
+      })
+      expect(provider.redirectUrl).toBe('https://localhost:8443/oauth/callback')
+    })
+
+    it('omits the default port for https (443)', () => {
+      provider = new NodeOAuthClientProvider({
+        ...defaultOptions,
+        callbackScheme: 'https',
+        callbackPort: 443,
+        host: 'my-domain.com',
+      })
+      expect(provider.redirectUrl).toBe('https://my-domain.com/oauth/callback')
+    })
+
+    it('omits the default port for http (80)', () => {
+      provider = new NodeOAuthClientProvider({
+        ...defaultOptions,
+        callbackScheme: 'http',
+        callbackPort: 80,
+        host: 'my-domain.com',
+      })
+      expect(provider.redirectUrl).toBe('http://my-domain.com/oauth/callback')
+    })
+
+    it('honors a custom callback path', () => {
+      provider = new NodeOAuthClientProvider({
+        ...defaultOptions,
+        callbackPath: '/api/v1/oauth/callback',
+      })
+      expect(provider.redirectUrl).toBe('http://localhost:8080/api/v1/oauth/callback')
+    })
+  })
+
   describe('credential invalidation', () => {
     it('should reset to default scopes after client invalidation', async () => {
       provider = new NodeOAuthClientProvider(defaultOptions)

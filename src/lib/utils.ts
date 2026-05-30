@@ -20,8 +20,12 @@ import crypto from 'crypto'
 import fs from 'fs'
 import { readFile, rm } from 'fs/promises'
 import path from 'path'
+import { exec } from 'child_process'
+import { promisify } from 'util'
 import { version as MCP_REMOTE_VERSION } from '../../package.json'
 import { EnvHttpProxyAgent, fetch, Headers, RequestInit, setGlobalDispatcher } from 'undici'
+
+const execAsync = promisify(exec)
 
 // Global type declaration for typescript
 declare global {
@@ -87,6 +91,63 @@ export function log(str: string, ...rest: unknown[]) {
 
   // If debug mode is on, also log to debug file
   debugLog(str, ...rest)
+}
+
+/**
+ * Context for hook scripts. Exposed to the script as MCP_REMOTE_* env vars.
+ */
+export interface HookEnv {
+  /** Local port the OAuth callback listener binds to */
+  listenPort: number
+  /** Port advertised in the OAuth redirect URI (may differ if behind a reverse proxy) */
+  callbackPort: number
+  /** Hostname advertised in the OAuth redirect URI */
+  host: string
+  /** Scheme advertised in the OAuth redirect URI (http or https) */
+  scheme: 'http' | 'https'
+  /** Full path of the OAuth callback endpoint */
+  callbackPath: string
+}
+
+export type HookPhase = 'pre-listen' | 'post-auth'
+
+function buildHookEnv(phase: HookPhase, env: HookEnv): Record<string, string> {
+  const redirectUri = new URL(`${env.scheme}://${env.host}:${env.callbackPort}${env.callbackPath}`).toString()
+  return {
+    MCP_REMOTE_HOOK_PHASE: phase,
+    MCP_REMOTE_LISTEN_PORT: String(env.listenPort),
+    MCP_REMOTE_CALLBACK_PORT: String(env.callbackPort),
+    MCP_REMOTE_CALLBACK_HOST: env.host,
+    MCP_REMOTE_CALLBACK_SCHEME: env.scheme,
+    MCP_REMOTE_CALLBACK_PATH: env.callbackPath,
+    MCP_REMOTE_CALLBACK_REDIRECT_URI: redirectUri,
+  }
+}
+
+/**
+ * Runs a shell hook command for the given phase. Hooks are best-effort: failures
+ * are logged but do not abort the OAuth flow (the user will see a downstream failure
+ * if the hook was load-bearing). Resolves once the hook exits.
+ */
+export async function runHook(phase: HookPhase, command: string | undefined, env: HookEnv): Promise<void> {
+  if (!command) return
+
+  const hookEnv = buildHookEnv(phase, env)
+  log(`Running ${phase} hook: ${command}`)
+  debugLog(`${phase} hook env`, hookEnv)
+
+  try {
+    const { stdout, stderr } = await execAsync(command, {
+      env: { ...process.env, ...hookEnv },
+    })
+    if (stdout?.trim()) log(`[${phase}-hook] ${stdout.trim()}`)
+    if (stderr?.trim()) log(`[${phase}-hook stderr] ${stderr.trim()}`)
+    log(`${phase} hook completed`)
+  } catch (error: any) {
+    log(`${phase} hook failed (exit ${error.code ?? '?'}): ${error.message}`)
+    if (error.stdout) log(`[${phase}-hook stdout] ${String(error.stdout).trim()}`)
+    if (error.stderr) log(`[${phase}-hook stderr] ${String(error.stderr).trim()}`)
+  }
 }
 
 type Message = any
@@ -681,14 +742,25 @@ async function findExistingClientPort(serverUrlHash: string): Promise<number | u
     return undefined
   }
 
-  const localhostRedirectUri = clientInfo.redirect_uris
-    .map((uri) => new URL(uri))
-    .find(({ hostname }) => hostname === 'localhost' || hostname === '127.0.0.1')
-  if (!localhostRedirectUri) {
-    throw new Error('Cannot find localhost callback URI from existing client information')
+  // Prefer a localhost URI (typical setup); otherwise accept any URI that
+  // carries an explicit port (relevant when --host points at a reverse proxy).
+  const parsedUris: URL[] = []
+  for (const uri of clientInfo.redirect_uris) {
+    try {
+      parsedUris.push(new URL(uri))
+    } catch {
+      // ignore unparseable URIs
+    }
   }
 
-  return parseInt(localhostRedirectUri.port)
+  const match =
+    parsedUris.find(({ hostname }) => hostname === 'localhost' || hostname === '127.0.0.1') ?? parsedUris.find(({ port }) => port !== '')
+
+  if (!match || !match.port) {
+    return undefined
+  }
+
+  return parseInt(match.port)
 }
 
 function calculateDefaultPort(serverUrlHash: string): number {
@@ -732,7 +804,8 @@ export async function findAvailablePort(preferredPort?: number): Promise<number>
  * Parses command line arguments for MCP clients and proxies
  * @param args Command line arguments
  * @param usage Usage message to show on error
- * @returns A promise that resolves to an object with parsed serverUrl, callbackPort and headers
+ * @returns A promise that resolves to an object with the parsed serverUrl, listen port,
+ *   advertised callback port, callback path, and other configuration values.
  */
 export async function parseCommandLineArgs(args: string[], usage: string) {
   // Process headers
@@ -755,8 +828,70 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
   }
 
   const serverUrl = args[0]
-  const specifiedPort = args[1] ? parseInt(args[1]) : undefined
+  // The positional listen port must look like a port number; otherwise treat it
+  // as a different argument (e.g., a flag) and ignore.
+  const positionalPortParsed = args[1] ? parseInt(args[1], 10) : NaN
+  const specifiedPort = !isNaN(positionalPortParsed) && positionalPortParsed > 0 ? positionalPortParsed : undefined
   const allowHttp = args.includes('--allow-http')
+
+  // Parse --callback-port: port advertised in the OAuth redirect URI.
+  // Defaults to the listen port; differs when behind a reverse proxy.
+  let specifiedCallbackPort: number | undefined
+  const callbackPortIndex = args.indexOf('--callback-port')
+  if (callbackPortIndex !== -1 && callbackPortIndex < args.length - 1) {
+    const parsed = parseInt(args[callbackPortIndex + 1], 10)
+    if (!isNaN(parsed) && parsed > 0) {
+      specifiedCallbackPort = parsed
+    } else {
+      log(`Warning: Ignoring invalid --callback-port value: ${args[callbackPortIndex + 1]}. Must be a positive number.`)
+    }
+  }
+
+  // Parse --pre-listen-hook and --post-auth-hook: shell commands invoked around the
+  // OAuth callback listener lifecycle. Useful for adding/removing a transient
+  // reverse-proxy rule that forwards the callback URL to the local listener.
+  let preListenHook: string | undefined
+  const preListenHookIndex = args.indexOf('--pre-listen-hook')
+  if (preListenHookIndex !== -1 && preListenHookIndex < args.length - 1) {
+    preListenHook = args[preListenHookIndex + 1]
+    log(`Using pre-listen hook: ${preListenHook}`)
+  }
+
+  let postAuthHook: string | undefined
+  const postAuthHookIndex = args.indexOf('--post-auth-hook')
+  if (postAuthHookIndex !== -1 && postAuthHookIndex < args.length - 1) {
+    postAuthHook = args[postAuthHookIndex + 1]
+    log(`Using post-auth hook: ${postAuthHook}`)
+  }
+
+  // Parse --callback-scheme: scheme advertised in the OAuth redirect URI.
+  // Defaults to http; set to https when behind an HTTPS-terminating reverse proxy.
+  let callbackScheme: 'http' | 'https' = 'http'
+  const callbackSchemeIndex = args.indexOf('--callback-scheme')
+  if (callbackSchemeIndex !== -1 && callbackSchemeIndex < args.length - 1) {
+    const value = args[callbackSchemeIndex + 1]
+    if (value === 'http' || value === 'https') {
+      callbackScheme = value
+      log(`Using callback scheme: ${callbackScheme}`)
+    } else {
+      log(`Warning: Ignoring invalid --callback-scheme value: ${value}. Must be 'http' or 'https'.`)
+    }
+  }
+
+  // Parse --callback-path-prefix: prefix prepended to /oauth/callback for both
+  // the local listener path and the advertised redirect URI path.
+  let callbackPathPrefix = ''
+  const callbackPathPrefixIndex = args.indexOf('--callback-path-prefix')
+  if (callbackPathPrefixIndex !== -1 && callbackPathPrefixIndex < args.length - 1) {
+    const raw = args[callbackPathPrefixIndex + 1]
+    // Strip leading/trailing slashes, then re-add a single leading slash if non-empty.
+    const trimmed = raw.replace(/^\/+|\/+$/g, '')
+    callbackPathPrefix = trimmed ? `/${trimmed}` : ''
+    if (callbackPathPrefix) {
+      log(`Using callback path prefix: ${callbackPathPrefix}`)
+    }
+  }
+  const callbackPath = `${callbackPathPrefix}/oauth/callback`
 
   // Check for debug flag
   const debug = args.includes('--debug')
@@ -889,25 +1024,42 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
 
   const defaultPort = calculateDefaultPort(serverUrlHash)
 
-  // Use the specified port, or the existing client port or fallback to find an available one
+  // The positional arg is the local listen port. The --callback-port flag, when
+  // provided, is the port advertised in the OAuth redirect URI (used when a reverse
+  // proxy fronts the local listener on a different port).
   const [existingClientPort, availablePort] = await Promise.all([findExistingClientPort(serverUrlHash), findAvailablePort(defaultPort)])
+  let port: number
   let callbackPort: number
 
-  if (specifiedPort) {
-    if (existingClientPort && specifiedPort !== existingClientPort) {
-      log(
-        `Warning! Specified callback port of ${specifiedPort}, which conflicts with existing client registration port ${existingClientPort}. Deleting existing client data to force reregistration.`,
-      )
-      await rm(getConfigFilePath(serverUrlHash, 'client_info.json'))
-    }
-    log(`Using specified callback port: ${specifiedPort}`)
+  if (specifiedCallbackPort) {
+    // Decouple advertised port from listen port.
+    callbackPort = specifiedCallbackPort
+    port = specifiedPort ?? availablePort
+    log(`Using specified callback (advertised) port: ${callbackPort}`)
+    log(`Using listen port: ${port}`)
+  } else if (specifiedPort) {
+    // Single positional port - listen and advertised are the same.
+    port = specifiedPort
     callbackPort = specifiedPort
+    log(`Using specified callback port: ${specifiedPort}`)
   } else if (existingClientPort) {
-    log(`Using existing client port: ${existingClientPort}`)
+    // Reuse the existing registration's port to avoid re-registering.
+    port = existingClientPort
     callbackPort = existingClientPort
+    log(`Using existing client port: ${existingClientPort}`)
   } else {
-    log(`Using automatically selected callback port: ${availablePort}`)
+    port = availablePort
     callbackPort = availablePort
+    log(`Using automatically selected callback port: ${availablePort}`)
+  }
+
+  // If the advertised port no longer matches the previously-registered redirect URI,
+  // delete the stored client info so we re-register with the new URI.
+  if (existingClientPort && callbackPort !== existingClientPort) {
+    log(
+      `Warning! Advertised callback port of ${callbackPort} conflicts with existing client registration port ${existingClientPort}. Deleting existing client data to force reregistration.`,
+    )
+    await rm(getConfigFilePath(serverUrlHash, 'client_info.json'))
   }
 
   if (Object.keys(headers).length > 0) {
@@ -931,7 +1083,10 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
 
   return {
     serverUrl,
+    port,
     callbackPort,
+    callbackPath,
+    callbackScheme,
     headers,
     transportStrategy,
     host,
@@ -942,6 +1097,8 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     ignoredTools,
     authTimeoutMs,
     serverUrlHash,
+    preListenHook,
+    postAuthHook,
   }
 }
 

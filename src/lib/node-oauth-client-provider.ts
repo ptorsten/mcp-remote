@@ -22,6 +22,7 @@ import type { ProtectedResourceMetadata } from './protected-resource-metadata'
 export class NodeOAuthClientProvider implements OAuthClientProvider {
   private serverUrlHash: string
   private callbackPath: string
+  private callbackScheme: 'http' | 'https'
   private clientName: string
   private clientUri: string
   private softwareId: string
@@ -42,6 +43,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   constructor(readonly options: OAuthProviderOptions) {
     this.serverUrlHash = options.serverUrlHash
     this.callbackPath = options.callbackPath || '/oauth/callback'
+    this.callbackScheme = options.callbackScheme || 'http'
     this.clientName = options.clientName || 'MCP CLI Client'
     this.clientUri = options.clientUri || 'https://github.com/modelcontextprotocol/mcp-cli'
     this.softwareId = options.softwareId || '2e6dc280-f3c3-4e01-99a7-8181dbd1d23d'
@@ -57,7 +59,10 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   }
 
   get redirectUrl(): string {
-    return `http://${this.options.host}:${this.options.callbackPort}${this.callbackPath}`
+    // Use URL to normalize away the default port (443 for https, 80 for http)
+    // so the registered URI matches what OAuth servers typically canonicalize to.
+    const url = new URL(`${this.callbackScheme}://${this.options.host}:${this.options.callbackPort}${this.callbackPath}`)
+    return url.toString()
   }
 
   get clientMetadata() {

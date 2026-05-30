@@ -1,5 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { parseCommandLineArgs, shouldIncludeTool, mcpProxy, setupOAuthCallbackServerWithLongPoll, getServerUrlHash } from './utils'
+import { parseCommandLineArgs, runHook, shouldIncludeTool, mcpProxy, setupOAuthCallbackServerWithLongPoll, getServerUrlHash } from './utils'
+import { mkdtempSync, rmSync, readFileSync, existsSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
 import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import { EventEmitter } from 'events'
 import express from 'express'
@@ -31,6 +34,161 @@ describe('Feature: Command Line Arguments Parsing', () => {
     // Then both server URL and callback port should be correctly extracted
     expect(result.serverUrl).toBe('https://example.com/sse')
     expect(result.callbackPort).toBe(3000)
+    // And listen port defaults to the same value as the advertised callback port
+    expect(result.port).toBe(3000)
+    // And the callback path defaults to /oauth/callback
+    expect(result.callbackPath).toBe('/oauth/callback')
+  })
+
+  it('Scenario: Parse --callback-port decouples advertised port from listen port', async () => {
+    // Given a positional listen port and a separate --callback-port flag
+    const args = ['https://example.com/sse', '3334', '--callback-port', '443']
+    const usage = 'test usage'
+
+    // When parsing the command line arguments
+    const result = await parseCommandLineArgs(args, usage)
+
+    // Then the advertised callback port should be 443 and the listen port 3334
+    expect(result.port).toBe(3334)
+    expect(result.callbackPort).toBe(443)
+  })
+
+  it('Scenario: --callback-port without positional listen port picks an available listen port', async () => {
+    // Given only --callback-port is provided
+    const args = ['https://example.com/sse', '--callback-port', '443']
+    const usage = 'test usage'
+
+    // When parsing the command line arguments
+    const result = await parseCommandLineArgs(args, usage)
+
+    // Then advertised port is 443 and listen port is a chosen available port (not 443)
+    expect(result.callbackPort).toBe(443)
+    expect(typeof result.port).toBe('number')
+    expect(result.port).toBeGreaterThan(0)
+  })
+
+  it('Scenario: Ignore invalid --callback-port value', async () => {
+    // Given an invalid --callback-port value
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const args = ['https://example.com/sse', '3334', '--callback-port', 'not-a-port']
+    const usage = 'test usage'
+
+    // When parsing the command line arguments
+    const result = await parseCommandLineArgs(args, usage)
+
+    // Then the invalid value is ignored and callbackPort falls back to listen port
+    expect(result.callbackPort).toBe(3334)
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('Warning: Ignoring invalid --callback-port value'))
+    consoleSpy.mockRestore()
+  })
+
+  it('Scenario: Parse --callback-path-prefix adds prefix to callback path', async () => {
+    // Given --callback-path-prefix /api/v1
+    const args = ['https://example.com/sse', '--callback-path-prefix', '/api/v1']
+    const usage = 'test usage'
+
+    // When parsing the command line arguments
+    const result = await parseCommandLineArgs(args, usage)
+
+    // Then the full callback path includes the prefix
+    expect(result.callbackPath).toBe('/api/v1/oauth/callback')
+  })
+
+  it('Scenario: --callback-path-prefix normalizes leading and trailing slashes', async () => {
+    // Given a prefix without leading slash and with trailing slash
+    const args = ['https://example.com/sse', '--callback-path-prefix', 'api/v1/']
+    const usage = 'test usage'
+
+    // When parsing the command line arguments
+    const result = await parseCommandLineArgs(args, usage)
+
+    // Then the slashes are normalized so the full path is well-formed
+    expect(result.callbackPath).toBe('/api/v1/oauth/callback')
+  })
+
+  it('Scenario: Parse --callback-scheme https', async () => {
+    // Given --callback-scheme https
+    const args = ['https://example.com/sse', '--callback-scheme', 'https']
+    const usage = 'test usage'
+
+    // When parsing the command line arguments
+    const result = await parseCommandLineArgs(args, usage)
+
+    // Then the callback scheme is https
+    expect(result.callbackScheme).toBe('https')
+  })
+
+  it('Scenario: Default --callback-scheme is http', async () => {
+    // Given no --callback-scheme flag
+    const args = ['https://example.com/sse']
+    const usage = 'test usage'
+
+    // When parsing the command line arguments
+    const result = await parseCommandLineArgs(args, usage)
+
+    // Then the callback scheme defaults to http (preserves prior behavior)
+    expect(result.callbackScheme).toBe('http')
+  })
+
+  it('Scenario: Ignore invalid --callback-scheme value', async () => {
+    // Given an invalid --callback-scheme value
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const args = ['https://example.com/sse', '--callback-scheme', 'ftp']
+    const usage = 'test usage'
+
+    // When parsing the command line arguments
+    const result = await parseCommandLineArgs(args, usage)
+
+    // Then the invalid value is ignored and scheme falls back to http
+    expect(result.callbackScheme).toBe('http')
+    expect(consoleSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Warning: Ignoring invalid --callback-scheme value: ftp. Must be 'http' or 'https'."),
+    )
+    consoleSpy.mockRestore()
+  })
+
+  it('Scenario: Parse --pre-listen-hook and --post-auth-hook', async () => {
+    // Given hook commands
+    const args = [
+      'https://example.com/sse',
+      '--pre-listen-hook',
+      '/usr/local/bin/my-helper add',
+      '--post-auth-hook',
+      '/usr/local/bin/my-helper remove',
+    ]
+    const usage = 'test usage'
+
+    // When parsing the command line arguments
+    const result = await parseCommandLineArgs(args, usage)
+
+    // Then the hook commands are returned verbatim
+    expect(result.preListenHook).toBe('/usr/local/bin/my-helper add')
+    expect(result.postAuthHook).toBe('/usr/local/bin/my-helper remove')
+  })
+
+  it('Scenario: Hooks default to undefined when not specified', async () => {
+    // Given no hook flags
+    const args = ['https://example.com/sse']
+    const usage = 'test usage'
+
+    // When parsing the command line arguments
+    const result = await parseCommandLineArgs(args, usage)
+
+    // Then hooks are undefined
+    expect(result.preListenHook).toBeUndefined()
+    expect(result.postAuthHook).toBeUndefined()
+  })
+
+  it('Scenario: Empty --callback-path-prefix leaves the default path', async () => {
+    // Given --callback-path-prefix with an empty/slash-only value
+    const args = ['https://example.com/sse', '--callback-path-prefix', '/']
+    const usage = 'test usage'
+
+    // When parsing the command line arguments
+    const result = await parseCommandLineArgs(args, usage)
+
+    // Then the path remains /oauth/callback (no spurious leading slash duplication)
+    expect(result.callbackPath).toBe('/oauth/callback')
   })
 
   it('Scenario: Parse localhost URL with HTTP protocol', async () => {
@@ -1024,6 +1182,75 @@ describe('setupOAuthCallbackServerWithLongPoll', () => {
     // Test that the server was created with defaults
     expect(server).toBeDefined()
     expect(typeof result.waitForAuthCode).toBe('function')
+  })
+})
+
+describe('Feature: Lifecycle Hooks', () => {
+  let tempDir: string
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), 'mcp-remote-hook-test-'))
+  })
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true })
+  })
+
+  const hookEnv = {
+    listenPort: 3334,
+    callbackPort: 443,
+    host: 'my-domain.com',
+    scheme: 'https' as const,
+    callbackPath: '/mcp/oauth/callback',
+  }
+
+  it('Scenario: No-op when no command is provided', async () => {
+    // Given no hook command (undefined)
+    // When runHook is called
+    // Then it resolves without throwing
+    await expect(runHook('pre-listen', undefined, hookEnv)).resolves.toBeUndefined()
+  })
+
+  it('Scenario: Hook receives MCP_REMOTE_* environment variables', async () => {
+    // Given a hook command that writes its env to a file
+    const outFile = join(tempDir, 'env.txt')
+    const command = `printenv | grep '^MCP_REMOTE_' | sort > ${outFile}`
+
+    // When the hook runs
+    await runHook('pre-listen', command, hookEnv)
+
+    // Then all expected env vars are present with the right values
+    expect(existsSync(outFile)).toBe(true)
+    const contents = readFileSync(outFile, 'utf8')
+    expect(contents).toContain('MCP_REMOTE_HOOK_PHASE=pre-listen')
+    expect(contents).toContain('MCP_REMOTE_LISTEN_PORT=3334')
+    expect(contents).toContain('MCP_REMOTE_CALLBACK_PORT=443')
+    expect(contents).toContain('MCP_REMOTE_CALLBACK_HOST=my-domain.com')
+    expect(contents).toContain('MCP_REMOTE_CALLBACK_SCHEME=https')
+    expect(contents).toContain('MCP_REMOTE_CALLBACK_PATH=/mcp/oauth/callback')
+    // Default port 443 should be stripped from the redirect URI by URL normalization
+    expect(contents).toContain('MCP_REMOTE_CALLBACK_REDIRECT_URI=https://my-domain.com/mcp/oauth/callback')
+  })
+
+  it('Scenario: Hook phase env var differs between phases', async () => {
+    // Given the same hook command run in both phases
+    const preFile = join(tempDir, 'pre.txt')
+    const postFile = join(tempDir, 'post.txt')
+
+    // When each hook runs
+    await runHook('pre-listen', `echo "$MCP_REMOTE_HOOK_PHASE" > ${preFile}`, hookEnv)
+    await runHook('post-auth', `echo "$MCP_REMOTE_HOOK_PHASE" > ${postFile}`, hookEnv)
+
+    // Then each receives the matching phase
+    expect(readFileSync(preFile, 'utf8').trim()).toBe('pre-listen')
+    expect(readFileSync(postFile, 'utf8').trim()).toBe('post-auth')
+  })
+
+  it('Scenario: Failing hook does not throw (best-effort)', async () => {
+    // Given a hook that exits non-zero
+    // When the hook runs
+    // Then runHook still resolves cleanly (failures are logged, not raised)
+    await expect(runHook('pre-listen', 'exit 7', hookEnv)).resolves.toBeUndefined()
   })
 })
 

@@ -30,7 +30,10 @@ import { createLazyAuthCoordinator } from './lib/coordination'
  */
 async function runProxy(
   serverUrl: string,
+  port: number,
   callbackPort: number,
+  callbackPath: string,
+  callbackScheme: 'http' | 'https',
   headers: Record<string, string>,
   transportStrategy: TransportStrategy = 'http-first',
   host: string,
@@ -40,12 +43,18 @@ async function runProxy(
   ignoredTools: string[],
   authTimeoutMs: number,
   serverUrlHash: string,
+  preListenHook: string | undefined,
+  postAuthHook: string | undefined,
 ) {
   // Set up event emitter for auth flow
   const events = new EventEmitter()
 
   // Create a lazy auth coordinator
-  const authCoordinator = createLazyAuthCoordinator(serverUrlHash, callbackPort, events, authTimeoutMs)
+  const authCoordinator = createLazyAuthCoordinator(serverUrlHash, port, events, authTimeoutMs, callbackPath, {
+    preListenHook,
+    postAuthHook,
+    env: { listenPort: port, callbackPort, host, scheme: callbackScheme, callbackPath },
+  })
 
   // Discover OAuth server info via Protected Resource Metadata (RFC 9728)
   // This probes the MCP server for WWW-Authenticate header and fetches PRM
@@ -67,6 +76,8 @@ async function runProxy(
   const authProvider = new NodeOAuthClientProvider({
     serverUrl: discoveryResult.authorizationServerUrl,
     callbackPort,
+    callbackPath,
+    callbackScheme,
     host,
     clientName: 'MCP CLI Proxy',
     staticOAuthClientMetadata,
@@ -169,7 +180,10 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx proxy.ts <https://se
   .then(
     ({
       serverUrl,
+      port,
       callbackPort,
+      callbackPath,
+      callbackScheme,
       headers,
       transportStrategy,
       host,
@@ -180,10 +194,15 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx proxy.ts <https://se
       ignoredTools,
       authTimeoutMs,
       serverUrlHash,
+      preListenHook,
+      postAuthHook,
     }) => {
       return runProxy(
         serverUrl,
+        port,
         callbackPort,
+        callbackPath,
+        callbackScheme,
         headers,
         transportStrategy,
         host,
@@ -193,6 +212,8 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx proxy.ts <https://se
         ignoredTools,
         authTimeoutMs,
         serverUrlHash,
+        preListenHook,
+        postAuthHook,
       )
     },
   )
