@@ -227,7 +227,15 @@ Each unique combination of server URL, resource, and custom headers will maintai
       ]
 ```
 
-  **In-process re-auth.** If the remote MCP server reports `401 Unauthorized` mid-session (e.g. the access token expired and refresh failed), `mcp-remote` does not exit. It closes the dead transport, resets the OAuth coordinator, drops stored tokens, and runs the OAuth flow again — which re-fires `--pre-listen-hook` and `--post-auth-hook` and registers a fresh callback listener. The new remote transport is swapped into the proxy without closing the stdio pipe, so your MCP client stays connected. In-flight requests on the dead transport are lost; the client is expected to retry them on its own.
+  **In-process re-auth.** If the remote MCP server reports `401 Unauthorized` mid-session, `mcp-remote` does not exit. It closes the dead transport, resets the OAuth coordinator, and reconnects via `connectToRemoteServer`. The SDK first attempts a **silent refresh-token exchange** with the stored `refresh_token` — when that succeeds (the usual case), no browser opens and the hooks do *not* fire. Only if the refresh itself fails does the full OAuth flow run again, which re-fires `--pre-listen-hook` (new listener + fresh `once` listener for the post-auth hook) and `--post-auth-hook`. The new remote transport is swapped into the proxy without closing the stdio pipe, so your MCP client stays connected. In-flight requests on the dead transport are lost; the client is expected to retry them on its own.
+
+  **Token expiry logging.** Every time tokens are saved — after the initial OAuth flow, after a silent refresh, and after a mid-session re-auth — `mcp-remote` logs the access-token lifetime and the absolute expiry timestamp, e.g.:
+
+  ```
+  OAuth tokens saved. Access token expires in 1.0h (at 5/30/2026, 6:42:11 PM). Refresh token: present.
+  ```
+
+  Run with `--debug` for the full token payload in `~/.mcp-auth/<hash>_debug.log`.
 
   Two example scripts ship with the repository:
 

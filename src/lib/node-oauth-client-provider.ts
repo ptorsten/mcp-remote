@@ -15,6 +15,13 @@ import { randomUUID } from 'node:crypto'
 import { fetchAuthorizationServerMetadata, type AuthorizationServerMetadata } from './authorization-server-metadata'
 import type { ProtectedResourceMetadata } from './protected-resource-metadata'
 
+function formatLifetime(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m`
+  if (seconds < 86400) return `${(seconds / 3600).toFixed(1)}h`
+  return `${(seconds / 86400).toFixed(1)}d`
+}
+
 /**
  * Implements the OAuthClientProvider interface for Node.js environments.
  * Handles OAuth flow and token storage for MCP clients.
@@ -241,6 +248,20 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
         tokenObject: JSON.stringify(tokens),
         stack: new Error('Invalid expires_in value').stack,
       })
+    }
+
+    // User-visible summary, printed every time tokens are saved — covers the
+    // initial OAuth flow, silent refresh-token exchanges, and mid-session
+    // re-auth. Lets the user see when the access token will expire without
+    // turning on --debug.
+    if (timeLeft > 0) {
+      const expiresAt = new Date(Date.now() + timeLeft * 1000)
+      log(
+        `OAuth tokens saved. Access token expires in ${formatLifetime(timeLeft)} (at ${expiresAt.toLocaleString()}). ` +
+          `Refresh token: ${tokens.refresh_token ? 'present' : 'none'}.`,
+      )
+    } else {
+      log(`OAuth tokens saved (no expires_in returned by server). Refresh token: ${tokens.refresh_token ? 'present' : 'none'}.`)
     }
 
     debugLog('Saving tokens', {

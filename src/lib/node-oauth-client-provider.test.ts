@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { NodeOAuthClientProvider } from './node-oauth-client-provider'
 import * as mcpAuthConfig from './mcp-auth-config'
+import * as utils from './utils'
 import type { OAuthProviderOptions } from './types'
 import type { AuthorizationServerMetadata } from './authorization-server-metadata'
 
@@ -172,6 +173,53 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
         callbackPath: '/api/v1/oauth/callback',
       })
       expect(provider.redirectUrl).toBe('http://localhost:8080/api/v1/oauth/callback')
+    })
+  })
+
+  describe('saveTokens logging', () => {
+    it('logs a user-visible lifetime + absolute expiry when expires_in is set', async () => {
+      const logSpy = vi.mocked(utils.log)
+      logSpy.mockClear()
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      await provider.saveTokens({
+        access_token: 'a',
+        token_type: 'Bearer',
+        expires_in: 3600,
+        refresh_token: 'r',
+      } as any)
+
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('OAuth tokens saved'))
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('expires in 1.0h'))
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('Refresh token: present'))
+    })
+
+    it('logs a no-expiry fallback when expires_in is missing', async () => {
+      const logSpy = vi.mocked(utils.log)
+      logSpy.mockClear()
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      await provider.saveTokens({
+        access_token: 'a',
+        token_type: 'Bearer',
+      } as any)
+
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('no expires_in returned'))
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('Refresh token: none'))
+    })
+
+    it('formats short lifetimes in minutes', async () => {
+      const logSpy = vi.mocked(utils.log)
+      logSpy.mockClear()
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      await provider.saveTokens({
+        access_token: 'a',
+        token_type: 'Bearer',
+        expires_in: 600,
+      } as any)
+
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('expires in 10m'))
     })
   })
 

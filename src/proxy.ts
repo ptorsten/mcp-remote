@@ -139,8 +139,14 @@ async function runProxy(
       await dead.close().catch(() => {})
 
       try {
+        // Reset the coordinator (close listener, clear lockfile) so any full
+        // OAuth flow that *does* need to happen gets a fresh listener + a new
+        // post-auth `once` listener. Do NOT invalidate stored tokens — the SDK
+        // will try a silent refresh-token exchange on the new transport.start()
+        // and only fall through to the browser-based OAuth flow if refresh
+        // fails. That path then re-enters our coordinator via authInitializer
+        // and re-fires --pre-listen-hook + --post-auth-hook as expected.
         await authCoordinator.resetForReAuth()
-        await authProvider.invalidateCredentials('tokens')
 
         currentRemoteTransport = await connectToRemoteServer(null, serverUrl, authProvider, headers, authInitializer, transportStrategy)
 
