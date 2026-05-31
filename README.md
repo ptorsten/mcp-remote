@@ -325,6 +325,19 @@ You can specify multiple `--ignore-tool` flags to ignore different patterns. Exa
       ]
 ```
 
+* To keep idle MCP sessions warm and surface dead connections faster, add the `--heartbeat-interval` flag with a value in seconds. When enabled, `mcp-remote` sends a JSON-RPC `ping` to the remote server at that interval; the pong response is consumed internally and never reaches your MCP client. Disabled by default (`0`). Useful when an SSE stream is dying with errors like `SSE stream disconnected: TypeError: terminated` — typically caused by an idle-timeout on a CDN, load balancer, or reverse proxy in front of the remote server. Pick an interval comfortably under that timeout (often `30` for 60s timeouts).
+
+```json
+      "args": [
+        "mcp-remote",
+        "https://remote.mcp.server/sse",
+        "--heartbeat-interval",
+        "30"
+      ]
+```
+
+  If a heartbeat send fails with `Unauthorized`, the existing mid-session re-auth path (silent refresh → browser fallback) kicks in automatically and the proxy reconnects without dropping stdio. The heartbeat timer is recreated on each reconnect.
+
 ### Transport Strategies
 
 MCP Remote supports different transport strategies when connecting to an MCP server. This allows you to control whether it uses Server-Sent Events (SSE) or HTTP transport, and in what order it tries them.

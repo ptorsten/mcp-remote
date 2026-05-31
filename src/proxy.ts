@@ -46,6 +46,7 @@ async function runProxy(
   serverUrlHash: string,
   preListenHook: string | undefined,
   postAuthHook: string | undefined,
+  heartbeatIntervalMs: number,
 ) {
   // Set up event emitter for auth flow
   const events = new EventEmitter()
@@ -158,12 +159,14 @@ async function runProxy(
         currentRemoteTransport = await connectToRemoteServer(null, serverUrl, authProvider, headers, authInitializer, transportStrategy)
 
         // Re-wire the proxy on top of the existing local transport. The fresh
-        // call also re-arms onAuthError for the next failure.
+        // call also re-arms onAuthError and restarts the heartbeat timer (the
+        // dead transport's stopHeartbeat fired in the close path above).
         mcpProxy({
           transportToClient: localTransport,
           transportToServer: currentRemoteTransport,
           ignoredTools,
           onAuthError: handleAuthError,
+          heartbeatIntervalMs,
         })
 
         log(`Re-auth complete; proxy resumed using ${currentRemoteTransport.constructor.name}`)
@@ -185,6 +188,7 @@ async function runProxy(
       transportToServer: currentRemoteTransport,
       ignoredTools,
       onAuthError: handleAuthError,
+      heartbeatIntervalMs,
     })
 
     // Start the local STDIO server
@@ -256,6 +260,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx proxy.ts <https://se
       serverUrlHash,
       preListenHook,
       postAuthHook,
+      heartbeatIntervalMs,
     }) => {
       return runProxy(
         serverUrl,
@@ -274,6 +279,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx proxy.ts <https://se
         serverUrlHash,
         preListenHook,
         postAuthHook,
+        heartbeatIntervalMs,
       )
     },
   )

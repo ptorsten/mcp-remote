@@ -241,6 +241,7 @@ export function mcpProxy({
   transportToServer,
   ignoredTools = [],
   onAuthError,
+  heartbeatIntervalMs,
 }: {
   transportToClient: Transport
   transportToServer: Transport
@@ -254,10 +255,24 @@ export function mcpProxy({
    * stdio side stays connected for the swap.
    */
   onAuthError?: (error: Error) => void | Promise<void>
+  /**
+   * If > 0, send a JSON-RPC `ping` to the remote server every N ms. Keeps idle
+   * SSE streams warm through CDNs/reverse proxies that drop idle connections,
+   * and surfaces dead connections faster (via the send-failure path) than
+   * waiting for the next user-triggered request. Pong responses are filtered
+   * out and not forwarded to the local client.
+   */
+  heartbeatIntervalMs?: number
 }) {
   let transportToClientClosed = false
   let transportToServerClosed = false
   let recoveringFromAuthError = false
+
+  // IDs we've sent ourselves as heartbeats. Used to filter pong responses out
+  // of the remote→local stream so they never reach the MCP client.
+  const heartbeatIds = new Set<string>()
+  let heartbeatSeq = 0
+  let heartbeatTimer: NodeJS.Timeout | undefined
 
   const messageTransformer = createMessageTransformer({
     transformRequestFunction: (request: Message) => {
@@ -325,17 +340,27 @@ export function mcpProxy({
 
   transportToServer.onmessage = (_message) => {
     // TODO: fix types
-    const message = messageTransformer.interceptResponse(_message as any)
-    log('[Remote→Local]', message.method || message.id)
+    const message = _message as any
+
+    // Heartbeat pong: don't forward our own ping responses to the local MCP
+    // client. They're a side-channel between mcp-remote and the remote server.
+    if (message?.id != null && heartbeatIds.has(String(message.id))) {
+      heartbeatIds.delete(String(message.id))
+      debugLog('Heartbeat pong received', { id: message.id })
+      return
+    }
+
+    const intercepted = messageTransformer.interceptResponse(message)
+    log('[Remote→Local]', intercepted.method || intercepted.id)
 
     debugLog('Remote → Local message', {
-      method: message.method,
-      id: message.id,
-      result: message.result ? 'result-present' : undefined,
-      error: message.error,
+      method: intercepted.method,
+      id: intercepted.id,
+      result: intercepted.result ? 'result-present' : undefined,
+      error: intercepted.error,
     })
 
-    transportToClient.send(message).catch(onClientError)
+    transportToClient.send(intercepted).catch(onClientError)
   }
 
   transportToClient.onclose = () => {
@@ -345,6 +370,7 @@ export function mcpProxy({
 
     transportToClientClosed = true
     debugLog('Local transport closed, closing remote transport')
+    stopHeartbeat()
     transportToServer.close().catch(onServerError)
   }
 
@@ -353,6 +379,7 @@ export function mcpProxy({
       return
     }
     transportToServerClosed = true
+    stopHeartbeat()
     if (recoveringFromAuthError) {
       // The auth-error handler is swapping the remote transport. Don't tear
       // down the local stdio pipe — the new transport will be wired up shortly.
@@ -380,6 +407,7 @@ export function mcpProxy({
     // suppression flag so the imminent transport close doesn't drag down stdio.
     if (onAuthError && !recoveringFromAuthError && isLikelyAuthError(error)) {
       recoveringFromAuthError = true
+      stopHeartbeat()
       Promise.resolve()
         .then(() => onAuthError(error))
         .catch((handlerError) => {
@@ -387,6 +415,36 @@ export function mcpProxy({
           debugLog('onAuthError handler error', { stack: (handlerError as Error)?.stack })
         })
     }
+  }
+
+  function stopHeartbeat() {
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer)
+      heartbeatTimer = undefined
+      heartbeatIds.clear()
+    }
+  }
+
+  function sendHeartbeat() {
+    if (transportToServerClosed || transportToClientClosed) return
+    const id = `mcp-remote-heartbeat-${heartbeatSeq++}`
+    heartbeatIds.add(id)
+    const ping = { jsonrpc: '2.0' as const, method: 'ping', id, params: {} }
+    debugLog('Heartbeat ping sent', { id })
+    // Route send failures through onServerError so a heartbeat-detected
+    // UnauthorizedError trips the same recovery path as user-triggered errors.
+    transportToServer.send(ping).catch((error) => {
+      heartbeatIds.delete(id)
+      onServerError(error)
+    })
+  }
+
+  if (heartbeatIntervalMs && heartbeatIntervalMs > 0) {
+    log(`Heartbeat enabled: pinging remote every ${Math.round(heartbeatIntervalMs / 1000)}s`)
+    heartbeatTimer = setInterval(sendHeartbeat, heartbeatIntervalMs)
+    // Don't keep the event loop alive solely on this timer; mcp-remote's
+    // lifetime is owned by the stdio pipe, not the heartbeat.
+    heartbeatTimer.unref?.()
   }
 }
 
@@ -1078,6 +1136,26 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     }
   }
 
+  // Parse heartbeat interval. mcp-remote sends a JSON-RPC `ping` to the remote
+  // server at this interval, which keeps idle SSE streams alive through CDNs
+  // and reverse proxies that close idle connections, and surfaces dead
+  // connections faster than waiting for the next user-triggered request.
+  // Disabled by default — set a positive number of seconds to enable.
+  let heartbeatIntervalMs = 0
+  const heartbeatIndex = args.indexOf('--heartbeat-interval')
+  if (heartbeatIndex !== -1 && heartbeatIndex < args.length - 1) {
+    const seconds = parseInt(args[heartbeatIndex + 1], 10)
+    if (!isNaN(seconds) && seconds > 0) {
+      heartbeatIntervalMs = seconds * 1000
+      log(`Using heartbeat interval: ${seconds} seconds`)
+    } else if (!isNaN(seconds) && seconds === 0) {
+      // Explicit 0 disables; allowed without warning so users can override env-driven defaults.
+      heartbeatIntervalMs = 0
+    } else {
+      log(`Warning: Ignoring invalid --heartbeat-interval value: ${args[heartbeatIndex + 1]}. Must be a non-negative integer.`)
+    }
+  }
+
   if (!serverUrl) {
     log(usage)
     process.exit(1)
@@ -1176,6 +1254,7 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     serverUrlHash,
     preListenHook,
     postAuthHook,
+    heartbeatIntervalMs,
   }
 }
 
