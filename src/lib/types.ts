@@ -13,6 +13,8 @@ export interface OAuthProviderOptions {
   callbackPort: number
   /** Desired hostname for the OAuth callback server */
   host: string
+  /** URL scheme to advertise in the OAuth redirect URI (e.g. behind an HTTPS reverse proxy) */
+  callbackScheme?: 'http' | 'https'
   /** Path for the OAuth callback endpoint */
   callbackPath?: string
   /** Directory to store OAuth credentials */

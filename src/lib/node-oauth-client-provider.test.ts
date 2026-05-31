@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { NodeOAuthClientProvider } from './node-oauth-client-provider'
 import * as mcpAuthConfig from './mcp-auth-config'
+import * as utils from './utils'
 import type { OAuthProviderOptions } from './types'
 import type { AuthorizationServerMetadata } from './authorization-server-metadata'
 
@@ -14,6 +15,12 @@ vi.mock('./utils', () => ({
   debugLog: vi.fn(),
   DEBUG: false,
   MCP_REMOTE_VERSION: '1.0.0',
+  formatLifetime: (seconds: number) => {
+    if (seconds < 60) return `${Math.round(seconds)}s`
+    if (seconds < 3600) return `${Math.round(seconds / 60)}m`
+    if (seconds < 86400) return `${(seconds / 3600).toFixed(1)}h`
+    return `${(seconds / 86400).toFixed(1)}d`
+  },
 }))
 vi.mock('open', () => ({ default: vi.fn() }))
 
@@ -30,14 +37,17 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
     serverUrlHash: 'test-hash',
   }
 
+  let mockReadRawJsonFile: any
   beforeEach(() => {
     mockReadJsonFile = vi.mocked(mcpAuthConfig.readJsonFile)
     mockWriteJsonFile = vi.mocked(mcpAuthConfig.writeJsonFile)
     mockDeleteConfigFile = vi.mocked(mcpAuthConfig.deleteConfigFile)
+    mockReadRawJsonFile = vi.mocked(mcpAuthConfig.readRawJsonFile)
 
     mockReadJsonFile.mockResolvedValue(undefined)
     mockWriteJsonFile.mockResolvedValue(undefined)
     mockDeleteConfigFile.mockResolvedValue(undefined)
+    mockReadRawJsonFile.mockResolvedValue(undefined)
   })
 
   afterEach(() => {
@@ -128,6 +138,189 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
         software_id: '2e6dc280-f3c3-4e01-99a7-8181dbd1d23d',
         software_version: '1.0.0',
       })
+    })
+  })
+
+  describe('redirectUrl', () => {
+    it('defaults to http and includes the callback port', () => {
+      provider = new NodeOAuthClientProvider(defaultOptions)
+      expect(provider.redirectUrl).toBe('http://localhost:8080/oauth/callback')
+    })
+
+    it('honors --callback-scheme https', () => {
+      provider = new NodeOAuthClientProvider({
+        ...defaultOptions,
+        callbackScheme: 'https',
+        callbackPort: 8443,
+      })
+      expect(provider.redirectUrl).toBe('https://localhost:8443/oauth/callback')
+    })
+
+    it('omits the default port for https (443)', () => {
+      provider = new NodeOAuthClientProvider({
+        ...defaultOptions,
+        callbackScheme: 'https',
+        callbackPort: 443,
+        host: 'my-domain.com',
+      })
+      expect(provider.redirectUrl).toBe('https://my-domain.com/oauth/callback')
+    })
+
+    it('omits the default port for http (80)', () => {
+      provider = new NodeOAuthClientProvider({
+        ...defaultOptions,
+        callbackScheme: 'http',
+        callbackPort: 80,
+        host: 'my-domain.com',
+      })
+      expect(provider.redirectUrl).toBe('http://my-domain.com/oauth/callback')
+    })
+
+    it('honors a custom callback path', () => {
+      provider = new NodeOAuthClientProvider({
+        ...defaultOptions,
+        callbackPath: '/api/v1/oauth/callback',
+      })
+      expect(provider.redirectUrl).toBe('http://localhost:8080/api/v1/oauth/callback')
+    })
+  })
+
+  describe('saveTokens logging', () => {
+    it('logs a user-visible lifetime + absolute expiry when expires_in is set', async () => {
+      const logSpy = vi.mocked(utils.log)
+      logSpy.mockClear()
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      await provider.saveTokens({
+        access_token: 'a',
+        token_type: 'Bearer',
+        expires_in: 3600,
+        refresh_token: 'r',
+      } as any)
+
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('OAuth tokens saved'))
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('expires in 1.0h'))
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('Refresh token: present'))
+    })
+
+    it('logs a no-expiry fallback when expires_in is missing', async () => {
+      const logSpy = vi.mocked(utils.log)
+      logSpy.mockClear()
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      await provider.saveTokens({
+        access_token: 'a',
+        token_type: 'Bearer',
+      } as any)
+
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('no expires_in returned'))
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('Refresh token: none'))
+    })
+
+    it('formats short lifetimes in minutes', async () => {
+      const logSpy = vi.mocked(utils.log)
+      logSpy.mockClear()
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      await provider.saveTokens({
+        access_token: 'a',
+        token_type: 'Bearer',
+        expires_in: 600,
+      } as any)
+
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('expires in 10m'))
+    })
+
+    it('persists issued_at alongside the saved tokens', async () => {
+      provider = new NodeOAuthClientProvider(defaultOptions)
+      const before = Date.now()
+
+      await provider.saveTokens({
+        access_token: 'a',
+        token_type: 'Bearer',
+        expires_in: 3600,
+      } as any)
+
+      // writeJsonFile should be called with the original token fields *plus* issued_at
+      expect(mockWriteJsonFile).toHaveBeenCalledWith(
+        'test-hash',
+        'tokens.json',
+        expect.objectContaining({
+          access_token: 'a',
+          expires_in: 3600,
+          issued_at: expect.any(Number),
+        }),
+      )
+      const written = mockWriteJsonFile.mock.calls[0][2]
+      expect(written.issued_at).toBeGreaterThanOrEqual(before)
+      expect(written.issued_at).toBeLessThanOrEqual(Date.now())
+    })
+  })
+
+  describe('issued_at persistence and remaining lifetime', () => {
+    it('reads issued_at from disk and exposes it via tokensIssuedAt()', async () => {
+      const persistedAt = Date.now() - 60_000
+      mockReadRawJsonFile.mockResolvedValueOnce({
+        access_token: 'a',
+        token_type: 'Bearer',
+        expires_in: 3600,
+        refresh_token: 'r',
+        issued_at: persistedAt,
+      })
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      await provider.tokens()
+      expect(provider.tokensIssuedAt()).toBe(persistedAt)
+    })
+
+    it('computes remaining seconds from issued_at + expires_in', async () => {
+      const persistedAt = Date.now() - 600_000 // 10 minutes ago
+      mockReadRawJsonFile.mockResolvedValue({
+        access_token: 'a',
+        token_type: 'Bearer',
+        expires_in: 3600, // 60-minute lifetime
+        issued_at: persistedAt,
+      })
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      const remaining = await provider.accessTokenRemainingSeconds()
+      // ~3000s remaining (60 min - 10 min); allow a small fudge factor for test runtime.
+      expect(remaining).toBeGreaterThan(2990)
+      expect(remaining).toBeLessThanOrEqual(3000)
+    })
+
+    it('returns undefined remaining when issued_at is missing (older token file)', async () => {
+      mockReadRawJsonFile.mockResolvedValue({
+        access_token: 'a',
+        token_type: 'Bearer',
+        expires_in: 3600,
+      })
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      const remaining = await provider.accessTokenRemainingSeconds()
+      expect(remaining).toBeUndefined()
+    })
+
+    it('clamps remaining to 0 when issued_at is far in the past', async () => {
+      mockReadRawJsonFile.mockResolvedValue({
+        access_token: 'a',
+        token_type: 'Bearer',
+        expires_in: 60,
+        issued_at: Date.now() - 3600_000, // 1h ago, but token only valid 60s
+      })
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      const remaining = await provider.accessTokenRemainingSeconds()
+      expect(remaining).toBe(0)
+    })
+
+    it('returns undefined when tokens file does not exist', async () => {
+      mockReadRawJsonFile.mockResolvedValue(undefined)
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      const tokens = await provider.tokens()
+      expect(tokens).toBeUndefined()
+      expect(provider.tokensIssuedAt()).toBeUndefined()
     })
   })
 

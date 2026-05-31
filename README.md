@@ -146,6 +146,112 @@ Each unique combination of server URL, resource, and custom headers will maintai
       ]
 ```
 
+* To run `mcp-remote` behind a reverse proxy, you may need the OAuth redirect URI to advertise a different port than the one the local server actually listens on. Use `--callback-port` to set the port that appears in the registered redirect URI; it defaults to the listen port (the positional port argument).
+
+```json
+      "args": [
+        "mcp-remote",
+        "https://remote.mcp.server/sse",
+        "3334",
+        "--host",
+        "my-domain.com",
+        "--callback-port",
+        "443"
+      ]
+```
+
+  In this example `mcp-remote` listens on `127.0.0.1:3334`, while the redirect URI registered with the authorization server is `http://my-domain.com:443/oauth/callback`. Configure your reverse proxy to forward requests for that URL to `127.0.0.1:3334`.
+
+* To prepend a path prefix to the OAuth callback (so it can sit behind a reverse proxy that routes by path), pass `--callback-path-prefix`. The prefix is applied to *both* the local listener path and the registered redirect URI, so configure your reverse proxy to forward the prefix as-is (no stripping).
+
+```json
+      "args": [
+        "mcp-remote",
+        "https://remote.mcp.server/sse",
+        "--callback-path-prefix",
+        "/mcp"
+      ]
+```
+
+  This makes the local listener serve `/mcp/oauth/callback` and registers the redirect URI as `http://localhost:<callback-port>/mcp/oauth/callback`.
+
+* If the reverse proxy terminates TLS, set `--callback-scheme https` so the registered redirect URI uses `https://`. Combined with `--host`, `--callback-port`, and `--callback-path-prefix`, this lets the OAuth flow round-trip through your HTTPS-terminating proxy. Default ports (443 for https, 80 for http) are omitted from the URL so it matches what most authorization servers canonicalize to.
+
+```json
+      "args": [
+        "mcp-remote",
+        "https://remote.mcp.server/sse",
+        "3334",
+        "--host",
+        "my-domain.com",
+        "--callback-port",
+        "443",
+        "--callback-scheme",
+        "https"
+      ]
+```
+
+  Registers `https://my-domain.com/oauth/callback` as the redirect URI while the local listener runs on `127.0.0.1:3334`.
+
+* To set up the reverse proxy on demand (and tear it down once auth is done), use `--pre-listen-hook` and `--post-auth-hook`. The pre-listen hook runs synchronously just before the local OAuth callback listener binds; the post-auth hook fires after the OAuth code is received at the callback. Both are best-effort — failures are logged but do not abort the flow.
+
+  Each hook is invoked as a shell command with the following environment variables set:
+
+  | Variable                           | Meaning                                                         |
+  | ---------------------------------- | --------------------------------------------------------------- |
+  | `MCP_REMOTE_HOOK_PHASE`            | `pre-listen` or `post-auth`                                     |
+  | `MCP_REMOTE_LISTEN_PORT`           | Local port the OAuth listener binds to                          |
+  | `MCP_REMOTE_CALLBACK_PORT`         | Port advertised in the redirect URI (see `--callback-port`)     |
+  | `MCP_REMOTE_CALLBACK_HOST`         | Hostname advertised in the redirect URI (see `--host`)          |
+  | `MCP_REMOTE_CALLBACK_SCHEME`       | `http` or `https` (see `--callback-scheme`)                     |
+  | `MCP_REMOTE_CALLBACK_PATH`         | Callback path, e.g. `/oauth/callback`                           |
+  | `MCP_REMOTE_CALLBACK_REDIRECT_URI` | Full redirect URI                                               |
+
+  Hooks only fire on the primary mcp-remote instance — when a second instance attaches to an in-progress auth flow via lockfile coordination, it reuses the primary's setup and does not invoke any hooks.
+
+```json
+      "args": [
+        "mcp-remote",
+        "https://remote.mcp.server/sse",
+        "3334",
+        "--host",
+        "my-domain.com",
+        "--callback-port",
+        "443",
+        "--callback-scheme",
+        "https",
+        "--pre-listen-hook",
+        "/abs/path/to/examples/caddy-callback-proxy-hook.sh add",
+        "--post-auth-hook",
+        "/abs/path/to/examples/caddy-callback-proxy-hook.sh remove"
+      ]
+```
+
+  **In-process re-auth.** If the remote MCP server reports `401 Unauthorized` mid-session, `mcp-remote` does not exit. It closes the dead transport, resets the OAuth coordinator, and reconnects via `connectToRemoteServer`. The SDK first attempts a **silent refresh-token exchange** with the stored `refresh_token` — when that succeeds (the usual case), no browser opens and the hooks do *not* fire. Only if the refresh itself fails does the full OAuth flow run again, which re-fires `--pre-listen-hook` (new listener + fresh `once` listener for the post-auth hook) and `--post-auth-hook`. The new remote transport is swapped into the proxy without closing the stdio pipe, so your MCP client stays connected. In-flight requests on the dead transport are lost; the client is expected to retry them on its own.
+
+  **Token expiry logging.** Every time tokens are saved — after the initial OAuth flow, after a silent refresh, and after a mid-session re-auth — `mcp-remote` logs the access-token lifetime and the absolute expiry timestamp, e.g.:
+
+  ```
+  OAuth tokens saved. Access token expires in 1.0h (at 5/30/2026, 6:42:11 PM). Refresh token: present.
+  ```
+
+  On startup, `mcp-remote` also logs what's already on disk so you can tell whether a silent refresh path is possible without enabling `--debug`:
+
+  ```
+  Existing OAuth tokens loaded for https://example.remote/sse — 47m remaining, refresh token present (silent refresh will be attempted if needed).
+  ```
+
+  Remaining lifetime is computed from a sibling `issued_at` timestamp that `mcp-remote` writes alongside the OAuth fields in `tokens.json`. Tokens saved by older `mcp-remote` releases (no `issued_at` field) will show "remaining lifetime unknown" until they're next refreshed. Tokens are never wiped at startup — a restart always tries the existing access token first, then a silent refresh-token exchange, before falling through to the browser-based OAuth flow.
+
+  Run with `--debug` for the full token payload in `~/.mcp-auth/<hash>_debug.log`.
+
+  Two example scripts ship with the repository:
+
+  - [`examples/nginx-callback-proxy-hook.sh`](examples/nginx-callback-proxy-hook.sh) — writes an nginx `location` snippet into an included directory and reloads nginx.
+  - [`examples/caddy-callback-proxy-hook.sh`](examples/caddy-callback-proxy-hook.sh) — registers and deregisters a Caddy reverse-proxy route via Caddy's admin API (no daemon reload required).
+
+  Both register a transient reverse-proxy rule that forwards the OAuth callback path to mcp-remote's local listener for the duration of a single auth flow. If your refresh token later expires, run mcp-remote again to re-trigger the hooks — or omit `--post-auth-hook` and leave the rule in place permanently.
+
 * To allow HTTP connections in trusted private networks, add the `--allow-http` flag. Note: This should only be used in secure private networks where traffic cannot be intercepted.
 
 ```json

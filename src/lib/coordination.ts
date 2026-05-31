@@ -4,10 +4,24 @@ import { Server } from 'http'
 import express from 'express'
 import { AddressInfo } from 'net'
 import { unlinkSync } from 'fs'
-import { log, debugLog, setupOAuthCallbackServerWithLongPoll } from './utils'
+import { HookEnv, log, debugLog, runHook, setupOAuthCallbackServerWithLongPoll } from './utils'
+
+export interface CoordinationHooks {
+  preListenHook?: string
+  postAuthHook?: string
+  env: HookEnv
+}
 
 export type AuthCoordinator = {
   initializeAuth: () => Promise<{ server: Server; waitForAuthCode: () => Promise<string>; skipBrowserAuth: boolean }>
+  /**
+   * Tears down the cached auth state (closes the OAuth callback listener,
+   * removes the lockfile, clears the cached promise of the auth code) so the
+   * next `initializeAuth` call starts a fresh flow. Used by mid-session
+   * re-auth, where the previous authorization code is already consumed and we
+   * need new pre-listen/post-auth hook invocations.
+   */
+  resetForReAuth: () => Promise<void>
 }
 
 /**
@@ -124,15 +138,19 @@ export async function waitForAuthentication(port: number): Promise<boolean> {
 /**
  * Creates a lazy auth coordinator that will only initiate auth when needed
  * @param serverUrlHash The hash of the server URL
- * @param callbackPort The port to use for the callback server
+ * @param port The port to use for the callback server (local listener)
  * @param events The event emitter to use for signaling
+ * @param authTimeoutMs Long-poll timeout in milliseconds
+ * @param callbackPath The full callback path the server listens on
  * @returns An AuthCoordinator object with an initializeAuth method
  */
 export function createLazyAuthCoordinator(
   serverUrlHash: string,
-  callbackPort: number,
+  port: number,
   events: EventEmitter,
   authTimeoutMs: number,
+  callbackPath: string,
+  hooks?: CoordinationHooks,
 ): AuthCoordinator {
   let authState: { server: Server; waitForAuthCode: () => Promise<string>; skipBrowserAuth: boolean } | null = null
 
@@ -145,12 +163,31 @@ export function createLazyAuthCoordinator(
       }
 
       log('Initializing auth coordination on-demand')
-      debugLog('Initializing auth coordination on-demand', { serverUrlHash, callbackPort })
+      debugLog('Initializing auth coordination on-demand', { serverUrlHash, port, callbackPath })
 
       // Initialize auth using the existing coordinateAuth logic
-      authState = await coordinateAuth(serverUrlHash, callbackPort, events, authTimeoutMs)
+      authState = await coordinateAuth(serverUrlHash, port, events, authTimeoutMs, callbackPath, hooks)
       debugLog('Auth coordination completed', { skipBrowserAuth: authState.skipBrowserAuth })
       return authState
+    },
+    resetForReAuth: async () => {
+      if (!authState) {
+        debugLog('resetForReAuth called but no auth state to reset')
+        return
+      }
+      log('Resetting auth coordinator for mid-session re-auth')
+      const previous = authState
+      authState = null
+
+      // Close the OAuth callback listener so the next initializeAuth call binds
+      // a fresh one (which re-runs --pre-listen-hook and registers a fresh
+      // post-auth listener — the prior `once` listener was already consumed).
+      await new Promise<void>((resolve) => {
+        previous.server.close(() => resolve())
+      })
+      await deleteLockfile(serverUrlHash).catch((err) => {
+        debugLog('Error deleting lockfile during reset', err)
+      })
     },
   }
 }
@@ -164,11 +201,13 @@ export function createLazyAuthCoordinator(
  */
 export async function coordinateAuth(
   serverUrlHash: string,
-  callbackPort: number,
+  port: number,
   events: EventEmitter,
   authTimeoutMs: number,
+  callbackPath: string,
+  hooks?: CoordinationHooks,
 ): Promise<{ server: Server; waitForAuthCode: () => Promise<string>; skipBrowserAuth: boolean }> {
-  debugLog('Coordinating authentication', { serverUrlHash, callbackPort })
+  debugLog('Coordinating authentication', { serverUrlHash, port, callbackPath })
 
   // Check for a lockfile (disabled on Windows for the time being)
   const lockData = process.platform === 'win32' ? null : await checkLockfile(serverUrlHash)
@@ -225,11 +264,29 @@ export async function coordinateAuth(
     await deleteLockfile(serverUrlHash)
   }
 
+  // Pre-listen hook: lets the user prepare external state (e.g., add a reverse-proxy
+  // rule that forwards the callback URL) before the local listener starts. Only fires
+  // on the primary instance — secondaries reuse the primary's setup.
+  if (hooks?.preListenHook) {
+    await runHook('pre-listen', hooks.preListenHook, hooks.env)
+  }
+
+  // Post-auth hook: fires when the OAuth code lands at the callback. The browser's
+  // round-trip through the redirect URI is done at this point, so it is safe to tear
+  // down the transient reverse-proxy rule.
+  const postAuthCmd = hooks?.postAuthHook
+  const hookEnv = hooks?.env
+  if (postAuthCmd && hookEnv) {
+    events.once('auth-code-received', () => {
+      void runHook('post-auth', postAuthCmd, hookEnv)
+    })
+  }
+
   // Create our own lockfile
-  debugLog('Setting up OAuth callback server', { port: callbackPort })
+  debugLog('Setting up OAuth callback server', { port, callbackPath })
   const { server, waitForAuthCode, authCompletedPromise } = setupOAuthCallbackServerWithLongPoll({
-    port: callbackPort,
-    path: '/oauth/callback',
+    port,
+    path: callbackPath,
     events,
     authTimeoutMs,
   })

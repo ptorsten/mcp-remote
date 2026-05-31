@@ -18,6 +18,7 @@ import {
   setupSignalHandlers,
   log,
   debugLog,
+  logStartupTokenState,
   MCP_REMOTE_VERSION,
   connectToRemoteServer,
   TransportStrategy,
@@ -31,7 +32,10 @@ import { createLazyAuthCoordinator } from './lib/coordination'
  */
 async function runClient(
   serverUrl: string,
+  port: number,
   callbackPort: number,
+  callbackPath: string,
+  callbackScheme: 'http' | 'https',
   headers: Record<string, string>,
   transportStrategy: TransportStrategy = 'http-first',
   host: string,
@@ -39,12 +43,18 @@ async function runClient(
   staticOAuthClientInfo: StaticOAuthClientInformationFull,
   authTimeoutMs: number,
   serverUrlHash: string,
+  preListenHook: string | undefined,
+  postAuthHook: string | undefined,
 ) {
   // Set up event emitter for auth flow
   const events = new EventEmitter()
 
   // Create a lazy auth coordinator
-  const authCoordinator = createLazyAuthCoordinator(serverUrlHash, callbackPort, events, authTimeoutMs)
+  const authCoordinator = createLazyAuthCoordinator(serverUrlHash, port, events, authTimeoutMs, callbackPath, {
+    preListenHook,
+    postAuthHook,
+    env: { listenPort: port, callbackPort, host, scheme: callbackScheme, callbackPath },
+  })
 
   // Discover OAuth server info via Protected Resource Metadata (RFC 9728)
   // This probes the MCP server for WWW-Authenticate header and fetches PRM
@@ -66,6 +76,8 @@ async function runClient(
   const authProvider = new NodeOAuthClientProvider({
     serverUrl: discoveryResult.authorizationServerUrl,
     callbackPort,
+    callbackPath,
+    callbackScheme,
     host,
     clientName: 'MCP CLI Client',
     staticOAuthClientMetadata,
@@ -75,6 +87,9 @@ async function runClient(
     protectedResourceMetadata: discoveryResult.protectedResourceMetadata,
     wwwAuthenticateScope: discoveryResult.wwwAuthenticateScope,
   })
+
+  // Visibility: log what OAuth credentials we have on disk before connecting.
+  await logStartupTokenState(authProvider, serverUrl)
 
   // Create the client
   const client = new Client(
@@ -182,7 +197,10 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx client.ts <https://s
   .then(
     ({
       serverUrl,
+      port,
       callbackPort,
+      callbackPath,
+      callbackScheme,
       headers,
       transportStrategy,
       host,
@@ -190,10 +208,15 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx client.ts <https://s
       staticOAuthClientInfo,
       authTimeoutMs,
       serverUrlHash,
+      preListenHook,
+      postAuthHook,
     }) => {
       return runClient(
         serverUrl,
+        port,
         callbackPort,
+        callbackPath,
+        callbackScheme,
         headers,
         transportStrategy,
         host,
@@ -201,6 +224,8 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx client.ts <https://s
         staticOAuthClientInfo,
         authTimeoutMs,
         serverUrlHash,
+        preListenHook,
+        postAuthHook,
       )
     },
   )

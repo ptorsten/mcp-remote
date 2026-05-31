@@ -15,6 +15,7 @@ import {
   connectToRemoteServer,
   log,
   debugLog,
+  logStartupTokenState,
   mcpProxy,
   parseCommandLineArgs,
   setupSignalHandlers,
@@ -30,7 +31,10 @@ import { createLazyAuthCoordinator } from './lib/coordination'
  */
 async function runProxy(
   serverUrl: string,
+  port: number,
   callbackPort: number,
+  callbackPath: string,
+  callbackScheme: 'http' | 'https',
   headers: Record<string, string>,
   transportStrategy: TransportStrategy = 'http-first',
   host: string,
@@ -40,12 +44,18 @@ async function runProxy(
   ignoredTools: string[],
   authTimeoutMs: number,
   serverUrlHash: string,
+  preListenHook: string | undefined,
+  postAuthHook: string | undefined,
 ) {
   // Set up event emitter for auth flow
   const events = new EventEmitter()
 
   // Create a lazy auth coordinator
-  const authCoordinator = createLazyAuthCoordinator(serverUrlHash, callbackPort, events, authTimeoutMs)
+  const authCoordinator = createLazyAuthCoordinator(serverUrlHash, port, events, authTimeoutMs, callbackPath, {
+    preListenHook,
+    postAuthHook,
+    env: { listenPort: port, callbackPort, host, scheme: callbackScheme, callbackPath },
+  })
 
   // Discover OAuth server info via Protected Resource Metadata (RFC 9728)
   // This probes the MCP server for WWW-Authenticate header and fetches PRM
@@ -67,6 +77,8 @@ async function runProxy(
   const authProvider = new NodeOAuthClientProvider({
     serverUrl: discoveryResult.authorizationServerUrl,
     callbackPort,
+    callbackPath,
+    callbackScheme,
     host,
     clientName: 'MCP CLI Proxy',
     staticOAuthClientMetadata,
@@ -77,6 +89,12 @@ async function runProxy(
     protectedResourceMetadata: discoveryResult.protectedResourceMetadata,
     wwwAuthenticateScope: discoveryResult.wwwAuthenticateScope,
   })
+
+  // Visibility: report what OAuth credentials we already have on disk so the
+  // user can tell whether a silent refresh path is even possible. We never
+  // delete tokens on startup, so unless the server has revoked them this
+  // restart should be transparent.
+  await logStartupTokenState(authProvider, serverUrl)
 
   // Create the STDIO transport for local connections
   const localTransport = new StdioServerTransport()
@@ -107,24 +125,77 @@ async function runProxy(
 
   try {
     // Connect to remote server with lazy authentication
-    const remoteTransport = await connectToRemoteServer(null, serverUrl, authProvider, headers, authInitializer, transportStrategy)
+    let currentRemoteTransport = await connectToRemoteServer(null, serverUrl, authProvider, headers, authInitializer, transportStrategy)
+
+    // Mid-session re-auth: if the remote transport reports a 401 / Unauthorized,
+    // tear it down, reset the auth coordinator (so --pre-listen-hook re-fires
+    // and a fresh `once` listener is registered for --post-auth-hook), drop the
+    // stored tokens, and reconnect via the same connectToRemoteServer code path
+    // that handled initial auth. The new transport is swapped into the proxy
+    // without closing the local stdio pipe.
+    const handleAuthError = async (error: Error): Promise<void> => {
+      log('Mid-session auth error detected; attempting re-auth')
+      debugLog('Mid-session auth error', { message: error.message, stack: error.stack })
+
+      const dead = currentRemoteTransport
+      // Detach handlers synchronously so the in-flight close from the dead
+      // transport doesn't reach mcpProxy and trip the recovery flag twice.
+      dead.onclose = undefined
+      dead.onerror = undefined
+      dead.onmessage = undefined
+      await dead.close().catch(() => {})
+
+      try {
+        // Reset the coordinator (close listener, clear lockfile) so any full
+        // OAuth flow that *does* need to happen gets a fresh listener + a new
+        // post-auth `once` listener. Do NOT invalidate stored tokens — the SDK
+        // will try a silent refresh-token exchange on the new transport.start()
+        // and only fall through to the browser-based OAuth flow if refresh
+        // fails. That path then re-enters our coordinator via authInitializer
+        // and re-fires --pre-listen-hook + --post-auth-hook as expected.
+        await authCoordinator.resetForReAuth()
+
+        currentRemoteTransport = await connectToRemoteServer(null, serverUrl, authProvider, headers, authInitializer, transportStrategy)
+
+        // Re-wire the proxy on top of the existing local transport. The fresh
+        // call also re-arms onAuthError for the next failure.
+        mcpProxy({
+          transportToClient: localTransport,
+          transportToServer: currentRemoteTransport,
+          ignoredTools,
+          onAuthError: handleAuthError,
+        })
+
+        log(`Re-auth complete; proxy resumed using ${currentRemoteTransport.constructor.name}`)
+      } catch (reAuthError) {
+        log('Re-auth failed; closing connection:', reAuthError)
+        debugLog('Re-auth error', reAuthError)
+        try {
+          await localTransport.close()
+        } catch {
+          // best-effort cleanup
+        }
+        process.exit(1)
+      }
+    }
 
     // Set up bidirectional proxy between local and remote transports
     mcpProxy({
       transportToClient: localTransport,
-      transportToServer: remoteTransport,
+      transportToServer: currentRemoteTransport,
       ignoredTools,
+      onAuthError: handleAuthError,
     })
 
     // Start the local STDIO server
     await localTransport.start()
     log('Local STDIO server running')
-    log(`Proxy established successfully between local STDIO and remote ${remoteTransport.constructor.name}`)
+    log(`Proxy established successfully between local STDIO and remote ${currentRemoteTransport.constructor.name}`)
     log('Press Ctrl+C to exit')
 
     // Setup cleanup handler
     const cleanup = async () => {
-      await remoteTransport.close()
+      await currentRemoteTransport.close()
       await localTransport.close()
       // Only close the server if it was initialized
       if (server) {
@@ -169,7 +240,10 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx proxy.ts <https://se
   .then(
     ({
       serverUrl,
+      port,
       callbackPort,
+      callbackPath,
+      callbackScheme,
       headers,
       transportStrategy,
       host,
@@ -180,10 +254,15 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx proxy.ts <https://se
       ignoredTools,
       authTimeoutMs,
       serverUrlHash,
+      preListenHook,
+      postAuthHook,
     }) => {
       return runProxy(
         serverUrl,
+        port,
         callbackPort,
+        callbackPath,
+        callbackScheme,
         headers,
         transportStrategy,
         host,
@@ -193,6 +272,8 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx proxy.ts <https://se
         ignoredTools,
         authTimeoutMs,
         serverUrlHash,
+        preListenHook,
+        postAuthHook,
       )
     },
   )
