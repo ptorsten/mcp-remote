@@ -185,26 +185,27 @@ describe('Feature: Command Line Arguments Parsing', () => {
     expect(result.heartbeatIntervalMs).toBe(30000)
   })
 
-  it('Scenario: --heartbeat-interval defaults to 0 (disabled)', async () => {
+  it('Scenario: --heartbeat-interval defaults to 30 seconds when unspecified', async () => {
     const args = ['https://example.com/sse']
     const result = await parseCommandLineArgs(args, 'test usage')
-    expect(result.heartbeatIntervalMs).toBe(0)
+    expect(result.heartbeatIntervalMs).toBe(30_000)
   })
 
-  it('Scenario: --heartbeat-interval=0 keeps it disabled without warning', async () => {
+  it('Scenario: --heartbeat-interval=0 disables heartbeats without a warning', async () => {
     const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
     const args = ['https://example.com/sse', '--heartbeat-interval', '0']
     const result = await parseCommandLineArgs(args, 'test usage')
     expect(result.heartbeatIntervalMs).toBe(0)
     expect(consoleSpy).not.toHaveBeenCalledWith(expect.stringContaining('Warning'))
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('Heartbeat disabled'))
     consoleSpy.mockRestore()
   })
 
-  it('Scenario: Invalid --heartbeat-interval value is warned and defaults to 0', async () => {
+  it('Scenario: Invalid --heartbeat-interval value is warned and falls back to the default', async () => {
     const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
     const args = ['https://example.com/sse', '--heartbeat-interval', 'soon']
     const result = await parseCommandLineArgs(args, 'test usage')
-    expect(result.heartbeatIntervalMs).toBe(0)
+    expect(result.heartbeatIntervalMs).toBe(30_000)
     expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('Warning: Ignoring invalid --heartbeat-interval value: soon'))
     consoleSpy.mockRestore()
   })

@@ -1140,8 +1140,8 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
   // server at this interval, which keeps idle SSE streams alive through CDNs
   // and reverse proxies that close idle connections, and surfaces dead
   // connections faster than waiting for the next user-triggered request.
-  // Disabled by default — set a positive number of seconds to enable.
-  let heartbeatIntervalMs = 0
+  // Defaults to 30 seconds; pass `--heartbeat-interval 0` to disable.
+  let heartbeatIntervalMs = 30_000
   const heartbeatIndex = args.indexOf('--heartbeat-interval')
   if (heartbeatIndex !== -1 && heartbeatIndex < args.length - 1) {
     const seconds = parseInt(args[heartbeatIndex + 1], 10)
@@ -1149,8 +1149,9 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
       heartbeatIntervalMs = seconds * 1000
       log(`Using heartbeat interval: ${seconds} seconds`)
     } else if (!isNaN(seconds) && seconds === 0) {
-      // Explicit 0 disables; allowed without warning so users can override env-driven defaults.
+      // Explicit opt-out — silenced so it doesn't look like an error.
       heartbeatIntervalMs = 0
+      log('Heartbeat disabled (--heartbeat-interval 0)')
     } else {
       log(`Warning: Ignoring invalid --heartbeat-interval value: ${args[heartbeatIndex + 1]}. Must be a non-negative integer.`)
     }
