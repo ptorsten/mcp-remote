@@ -179,6 +179,37 @@ describe('Feature: Command Line Arguments Parsing', () => {
     expect(result.postAuthHook).toBeUndefined()
   })
 
+  it('Scenario: Parse --heartbeat-interval', async () => {
+    const args = ['https://example.com/sse', '--heartbeat-interval', '30']
+    const result = await parseCommandLineArgs(args, 'test usage')
+    expect(result.heartbeatIntervalMs).toBe(30000)
+  })
+
+  it('Scenario: --heartbeat-interval defaults to 30 seconds when unspecified', async () => {
+    const args = ['https://example.com/sse']
+    const result = await parseCommandLineArgs(args, 'test usage')
+    expect(result.heartbeatIntervalMs).toBe(30_000)
+  })
+
+  it('Scenario: --heartbeat-interval=0 disables heartbeats without a warning', async () => {
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const args = ['https://example.com/sse', '--heartbeat-interval', '0']
+    const result = await parseCommandLineArgs(args, 'test usage')
+    expect(result.heartbeatIntervalMs).toBe(0)
+    expect(consoleSpy).not.toHaveBeenCalledWith(expect.stringContaining('Warning'))
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('Heartbeat disabled'))
+    consoleSpy.mockRestore()
+  })
+
+  it('Scenario: Invalid --heartbeat-interval value is warned and falls back to the default', async () => {
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const args = ['https://example.com/sse', '--heartbeat-interval', 'soon']
+    const result = await parseCommandLineArgs(args, 'test usage')
+    expect(result.heartbeatIntervalMs).toBe(30_000)
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('Warning: Ignoring invalid --heartbeat-interval value: soon'))
+    consoleSpy.mockRestore()
+  })
+
   it('Scenario: Empty --callback-path-prefix leaves the default path', async () => {
     // Given --callback-path-prefix with an empty/slash-only value
     const args = ['https://example.com/sse', '--callback-path-prefix', '/']
@@ -1251,6 +1282,205 @@ describe('Feature: MCP Proxy', () => {
     // Then the local transport is NOT closed — the handler owns the swap
     await new Promise((resolve) => setImmediate(resolve))
     expect(mockTransportToClient.close).not.toHaveBeenCalled()
+  })
+
+  it('Scenario: heartbeat sends pings at the configured interval', async () => {
+    vi.useFakeTimers()
+    try {
+      const mockTransportToClient = {
+        send: vi.fn().mockResolvedValue(undefined),
+        close: vi.fn().mockResolvedValue(undefined),
+        start: vi.fn().mockResolvedValue(undefined),
+        onmessage: vi.fn(),
+        onclose: vi.fn(),
+        onerror: vi.fn(),
+      } as unknown as Transport
+      const mockTransportToServer = {
+        send: vi.fn().mockResolvedValue(undefined),
+        close: vi.fn().mockResolvedValue(undefined),
+        start: vi.fn().mockResolvedValue(undefined),
+        onmessage: vi.fn(),
+        onclose: vi.fn(),
+        onerror: vi.fn(),
+      } as unknown as Transport
+
+      mcpProxy({
+        transportToClient: mockTransportToClient,
+        transportToServer: mockTransportToServer,
+        ignoredTools: [],
+        heartbeatIntervalMs: 30_000,
+      })
+
+      // Advance past two intervals — expect two pings.
+      vi.advanceTimersByTime(31_000)
+      expect(mockTransportToServer.send).toHaveBeenCalledTimes(1)
+      expect(mockTransportToServer.send).toHaveBeenCalledWith(
+        expect.objectContaining({ method: 'ping', jsonrpc: '2.0', id: expect.stringMatching(/^mcp-remote-heartbeat-/) }),
+      )
+
+      vi.advanceTimersByTime(30_000)
+      expect(mockTransportToServer.send).toHaveBeenCalledTimes(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('Scenario: heartbeat pongs are filtered and not forwarded to the local client', async () => {
+    vi.useFakeTimers()
+    try {
+      const mockTransportToClient = {
+        send: vi.fn().mockResolvedValue(undefined),
+        close: vi.fn().mockResolvedValue(undefined),
+        start: vi.fn().mockResolvedValue(undefined),
+        onmessage: vi.fn(),
+        onclose: vi.fn(),
+        onerror: vi.fn(),
+      } as unknown as Transport
+      const mockTransportToServer = {
+        send: vi.fn().mockResolvedValue(undefined),
+        close: vi.fn().mockResolvedValue(undefined),
+        start: vi.fn().mockResolvedValue(undefined),
+        onmessage: vi.fn(),
+        onclose: vi.fn(),
+        onerror: vi.fn(),
+      } as unknown as Transport
+
+      mcpProxy({
+        transportToClient: mockTransportToClient,
+        transportToServer: mockTransportToServer,
+        ignoredTools: [],
+        heartbeatIntervalMs: 1000,
+      })
+
+      vi.advanceTimersByTime(1000)
+      const sentPing = (mockTransportToServer.send as any).mock.calls[0][0]
+      const heartbeatId = sentPing.id
+
+      // Server replies with the pong for that id
+      if (mockTransportToServer.onmessage) {
+        mockTransportToServer.onmessage({ jsonrpc: '2.0', id: heartbeatId, result: {} })
+      }
+
+      // Local client must not see the pong
+      expect(mockTransportToClient.send).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('Scenario: non-heartbeat responses are still forwarded when heartbeat is enabled', async () => {
+    vi.useFakeTimers()
+    try {
+      const mockTransportToClient = {
+        send: vi.fn().mockResolvedValue(undefined),
+        close: vi.fn().mockResolvedValue(undefined),
+        start: vi.fn().mockResolvedValue(undefined),
+        onmessage: vi.fn(),
+        onclose: vi.fn(),
+        onerror: vi.fn(),
+      } as unknown as Transport
+      const mockTransportToServer = {
+        send: vi.fn().mockResolvedValue(undefined),
+        close: vi.fn().mockResolvedValue(undefined),
+        start: vi.fn().mockResolvedValue(undefined),
+        onmessage: vi.fn(),
+        onclose: vi.fn(),
+        onerror: vi.fn(),
+      } as unknown as Transport
+
+      mcpProxy({
+        transportToClient: mockTransportToClient,
+        transportToServer: mockTransportToServer,
+        ignoredTools: [],
+        heartbeatIntervalMs: 60_000,
+      })
+
+      // Server-initiated message with a non-heartbeat id
+      if (mockTransportToServer.onmessage) {
+        mockTransportToServer.onmessage({ jsonrpc: '2.0', method: 'ping', id: 'server-ping-7' })
+      }
+
+      expect(mockTransportToClient.send).toHaveBeenCalledWith(expect.objectContaining({ id: 'server-ping-7' }))
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('Scenario: heartbeat stops when the remote transport closes', async () => {
+    vi.useFakeTimers()
+    try {
+      const mockTransportToClient = {
+        send: vi.fn().mockResolvedValue(undefined),
+        close: vi.fn().mockResolvedValue(undefined),
+        start: vi.fn().mockResolvedValue(undefined),
+        onmessage: vi.fn(),
+        onclose: vi.fn(),
+        onerror: vi.fn(),
+      } as unknown as Transport
+      const mockTransportToServer = {
+        send: vi.fn().mockResolvedValue(undefined),
+        close: vi.fn().mockResolvedValue(undefined),
+        start: vi.fn().mockResolvedValue(undefined),
+        onmessage: vi.fn(),
+        onclose: vi.fn(),
+        onerror: vi.fn(),
+      } as unknown as Transport
+
+      mcpProxy({
+        transportToClient: mockTransportToClient,
+        transportToServer: mockTransportToServer,
+        ignoredTools: [],
+        heartbeatIntervalMs: 1000,
+      })
+
+      vi.advanceTimersByTime(1000)
+      expect(mockTransportToServer.send).toHaveBeenCalledTimes(1)
+
+      // Simulate the remote transport closing
+      if (mockTransportToServer.onclose) {
+        mockTransportToServer.onclose()
+      }
+
+      // No more pings should fire after close
+      vi.advanceTimersByTime(5000)
+      expect(mockTransportToServer.send).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('Scenario: heartbeat is disabled when heartbeatIntervalMs is 0 or omitted', async () => {
+    vi.useFakeTimers()
+    try {
+      const mockTransportToClient = {
+        send: vi.fn().mockResolvedValue(undefined),
+        close: vi.fn().mockResolvedValue(undefined),
+        start: vi.fn().mockResolvedValue(undefined),
+        onmessage: vi.fn(),
+        onclose: vi.fn(),
+        onerror: vi.fn(),
+      } as unknown as Transport
+      const mockTransportToServer = {
+        send: vi.fn().mockResolvedValue(undefined),
+        close: vi.fn().mockResolvedValue(undefined),
+        start: vi.fn().mockResolvedValue(undefined),
+        onmessage: vi.fn(),
+        onclose: vi.fn(),
+        onerror: vi.fn(),
+      } as unknown as Transport
+
+      mcpProxy({
+        transportToClient: mockTransportToClient,
+        transportToServer: mockTransportToServer,
+        ignoredTools: [],
+        // heartbeatIntervalMs omitted
+      })
+
+      vi.advanceTimersByTime(120_000)
+      expect(mockTransportToServer.send).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('Scenario: without onAuthError, server-close still closes local transport', async () => {
