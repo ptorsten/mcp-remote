@@ -44,6 +44,14 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   // server returned `refresh_expires_in` (a common vendor extension —
   // Keycloak, Cognito, etc.). Same persistence trick as _tokensIssuedAt.
   private _refreshExpiresInSec: number | undefined
+  // Used to dedupe verbose tokens() debug logging. The SDK calls tokens() on
+  // every outbound request (including every heartbeat ping), which produced a
+  // wall of identical log blocks. We log the full block only when the result
+  // actually changes, or after a long idle gap so the user can confirm the
+  // path is still being exercised.
+  private _lastTokenLogFingerprint: string | undefined
+  private _lastTokenLogAt: number | undefined
+  private static readonly TOKEN_LOG_HEARTBEAT_MS = 5 * 60 * 1000
 
   /**
    * Creates a new NodeOAuthClientProvider
@@ -204,16 +212,13 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
    * @returns The OAuth tokens or undefined
    */
   async tokens(): Promise<OAuthTokens | undefined> {
-    debugLog('Reading OAuth tokens')
-    debugLog('Token request stack trace:', new Error().stack)
-
     // Read the JSON raw so we don't lose our sibling fields to the SDK
     // schema's default strip behavior.
     const raw = (await readRawJsonFile(this.serverUrlHash, 'tokens.json')) as Record<string, unknown> | undefined
     if (!raw) {
-      debugLog('Token result: Not found')
       this._tokensIssuedAt = undefined
       this._refreshExpiresInSec = undefined
+      this.maybeLogTokenRead('not-found', () => debugLog('Token result: Not found'))
       return undefined
     }
 
@@ -230,6 +235,8 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
 
     const timeLeft = tokens.expires_in || 0
     if (typeof tokens.expires_in !== 'number' || tokens.expires_in < 0) {
+      // Always warn on invalid expires_in regardless of dedupe — it signals a
+      // problem worth surfacing every time it happens.
       debugLog('⚠️ WARNING: Invalid expires_in detected while reading tokens ⚠️', {
         expiresIn: tokens.expires_in,
         tokenObject: JSON.stringify(tokens),
@@ -237,18 +244,51 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       })
     }
 
-    debugLog('Token result:', {
-      found: true,
-      hasAccessToken: !!tokens.access_token,
-      hasRefreshToken: !!tokens.refresh_token,
-      expiresIn: `${timeLeft} seconds`,
-      isExpired: timeLeft <= 0,
-      expiresInValue: tokens.expires_in,
-      issuedAt: this._tokensIssuedAt,
-      refreshExpiresIn: this._refreshExpiresInSec,
+    // Fingerprint the meaningful state of this read. Identical fingerprints
+    // mean the token hasn't been refreshed/changed since the last call, so we
+    // suppress the verbose log block.
+    const fingerprint = [
+      'found',
+      !!tokens.access_token,
+      !!tokens.refresh_token,
+      tokens.expires_in ?? 'no-expires-in',
+      this._tokensIssuedAt ?? 'no-issued-at',
+      this._refreshExpiresInSec ?? 'no-refresh-expires-in',
+    ].join('|')
+
+    this.maybeLogTokenRead(fingerprint, () => {
+      debugLog('Reading OAuth tokens')
+      debugLog('Token request stack trace:', new Error().stack)
+      debugLog('Token result:', {
+        found: true,
+        hasAccessToken: !!tokens.access_token,
+        hasRefreshToken: !!tokens.refresh_token,
+        expiresIn: `${timeLeft} seconds`,
+        isExpired: timeLeft <= 0,
+        expiresInValue: tokens.expires_in,
+        issuedAt: this._tokensIssuedAt,
+        refreshExpiresIn: this._refreshExpiresInSec,
+      })
     })
 
     return tokens
+  }
+
+  /**
+   * Calls `emit` only when the token state has changed since the last log, or
+   * when long enough has elapsed (TOKEN_LOG_HEARTBEAT_MS) that a periodic
+   * confirmation is helpful for debugging long-running sessions. Updates the
+   * dedupe state regardless of whether we emitted, so the gap clock resets.
+   */
+  private maybeLogTokenRead(fingerprint: string, emit: () => void): void {
+    const now = Date.now()
+    const changed = fingerprint !== this._lastTokenLogFingerprint
+    const stale = this._lastTokenLogAt === undefined || now - this._lastTokenLogAt >= NodeOAuthClientProvider.TOKEN_LOG_HEARTBEAT_MS
+    if (changed || stale) {
+      emit()
+      this._lastTokenLogFingerprint = fingerprint
+      this._lastTokenLogAt = now
+    }
   }
 
   /**
