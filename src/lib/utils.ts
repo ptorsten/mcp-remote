@@ -195,6 +195,7 @@ export async function logStartupTokenState(
   authProvider: {
     tokens(): Promise<{ access_token?: string; expires_in?: number; refresh_token?: string } | undefined>
     accessTokenRemainingSeconds?(): Promise<number | undefined>
+    refreshTokenRemainingSeconds?(): Promise<number | undefined>
   },
   serverUrl: string,
 ): Promise<void> {
@@ -207,9 +208,19 @@ export async function logStartupTokenState(
 
     const remaining = await authProvider.accessTokenRemainingSeconds?.()
     const lifetimeBlurb = remaining !== undefined ? `${formatLifetime(remaining)} remaining` : 'remaining lifetime unknown'
-    const refreshBlurb = existing.refresh_token
-      ? 'refresh token present (silent refresh will be attempted if needed)'
-      : 'no refresh token (browser auth needed if access token has expired)'
+
+    let refreshBlurb: string
+    if (!existing.refresh_token) {
+      refreshBlurb = 'no refresh token (browser auth needed if access token has expired)'
+    } else {
+      const refreshRemaining = await authProvider.refreshTokenRemainingSeconds?.()
+      if (refreshRemaining !== undefined) {
+        refreshBlurb = `refresh token valid for ${formatLifetime(refreshRemaining)} (silent refresh will be attempted if needed)`
+      } else {
+        refreshBlurb = 'refresh token present, lifetime unknown (silent refresh will be attempted if needed)'
+      }
+    }
+
     log(`Existing OAuth tokens loaded for ${serverUrl} — ${lifetimeBlurb}, ${refreshBlurb}.`)
   } catch (error) {
     debugLog('Failed to log startup token state', error)

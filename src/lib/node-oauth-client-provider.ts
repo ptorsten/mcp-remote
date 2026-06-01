@@ -40,6 +40,10 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   // field in the JSON file and read it via readRawJsonFile to avoid the SDK's
   // strict-by-default schema stripping it.
   private _tokensIssuedAt: number | undefined
+  // Lifetime in seconds that the saved refresh_token is valid for, if the
+  // server returned `refresh_expires_in` (a common vendor extension —
+  // Keycloak, Cognito, etc.). Same persistence trick as _tokensIssuedAt.
+  private _refreshExpiresInSec: number | undefined
 
   /**
    * Creates a new NodeOAuthClientProvider
@@ -203,16 +207,18 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     debugLog('Reading OAuth tokens')
     debugLog('Token request stack trace:', new Error().stack)
 
-    // Read the JSON raw so we don't lose our sibling `issued_at` field to the
-    // SDK schema's default strip behavior.
+    // Read the JSON raw so we don't lose our sibling fields to the SDK
+    // schema's default strip behavior.
     const raw = (await readRawJsonFile(this.serverUrlHash, 'tokens.json')) as Record<string, unknown> | undefined
     if (!raw) {
       debugLog('Token result: Not found')
       this._tokensIssuedAt = undefined
+      this._refreshExpiresInSec = undefined
       return undefined
     }
 
     this._tokensIssuedAt = typeof raw.issued_at === 'number' ? (raw.issued_at as number) : undefined
+    this._refreshExpiresInSec = typeof raw.refresh_expires_in === 'number' ? (raw.refresh_expires_in as number) : undefined
 
     let tokens: OAuthTokens
     try {
@@ -239,6 +245,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       isExpired: timeLeft <= 0,
       expiresInValue: tokens.expires_in,
       issuedAt: this._tokensIssuedAt,
+      refreshExpiresIn: this._refreshExpiresInSec,
     })
 
     return tokens
@@ -268,6 +275,20 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   }
 
   /**
+   * Computes the remaining lifetime (in seconds) of the saved refresh token,
+   * based on the stored `issued_at` and `refresh_expires_in`. Returns
+   * undefined when the server didn't provide `refresh_expires_in` (most
+   * common — RFC 6749 doesn't mandate it), or when the field isn't stamped
+   * on disk yet. Returns 0 when the refresh token is past its expiry.
+   */
+  async refreshTokenRemainingSeconds(): Promise<number | undefined> {
+    const tokens = await this.tokens()
+    if (!tokens?.refresh_token || !this._tokensIssuedAt || !this._refreshExpiresInSec) return undefined
+    const elapsedSec = (Date.now() - this._tokensIssuedAt) / 1000
+    return Math.max(0, this._refreshExpiresInSec - elapsedSec)
+  }
+
+  /**
    * Saves OAuth tokens
    * @param tokens The tokens to save
    */
@@ -275,6 +296,14 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     const timeLeft = tokens.expires_in || 0
     const issuedAt = Date.now()
     this._tokensIssuedAt = issuedAt
+
+    // `refresh_expires_in` is a vendor extension (Keycloak/Cognito/etc.) that
+    // RFC 6749 doesn't define, so it isn't in OAuthTokens. Best-effort: pull
+    // it off the runtime object if the SDK didn't strip it before us. The
+    // value is in seconds.
+    const rawRefreshExpires = (tokens as unknown as { refresh_expires_in?: unknown }).refresh_expires_in
+    const refreshExpiresIn = typeof rawRefreshExpires === 'number' && rawRefreshExpires >= 0 ? rawRefreshExpires : undefined
+    this._refreshExpiresInSec = refreshExpiresIn
 
     // Alert if expires_in is invalid
     if (typeof tokens.expires_in !== 'number' || tokens.expires_in < 0) {
@@ -285,18 +314,28 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       })
     }
 
+    // Build a refresh-token blurb for the user-visible log line. Either:
+    //  - present + known lifetime, with absolute expiry timestamp
+    //  - present but the server didn't tell us how long it lasts
+    //  - none (no refresh_token in the response)
+    const refreshBlurb = (() => {
+      if (!tokens.refresh_token) return 'Refresh token: none.'
+      if (refreshExpiresIn && refreshExpiresIn > 0) {
+        const refreshAt = new Date(issuedAt + refreshExpiresIn * 1000)
+        return `Refresh token valid for ${formatLifetime(refreshExpiresIn)} (until ${refreshAt.toLocaleString()}).`
+      }
+      return 'Refresh token: present (server did not provide refresh_expires_in; lifetime unknown until it fails).'
+    })()
+
     // User-visible summary, printed every time tokens are saved — covers the
     // initial OAuth flow, silent refresh-token exchanges, and mid-session
     // re-auth. Lets the user see when the access token will expire without
     // turning on --debug.
     if (timeLeft > 0) {
       const expiresAt = new Date(issuedAt + timeLeft * 1000)
-      log(
-        `OAuth tokens saved. Access token expires in ${formatLifetime(timeLeft)} (at ${expiresAt.toLocaleString()}). ` +
-          `Refresh token: ${tokens.refresh_token ? 'present' : 'none'}.`,
-      )
+      log(`OAuth tokens saved. Access token expires in ${formatLifetime(timeLeft)} (at ${expiresAt.toLocaleString()}). ${refreshBlurb}`)
     } else {
-      log(`OAuth tokens saved (no expires_in returned by server). Refresh token: ${tokens.refresh_token ? 'present' : 'none'}.`)
+      log(`OAuth tokens saved (no expires_in returned by server). ${refreshBlurb}`)
     }
 
     debugLog('Saving tokens', {
@@ -304,13 +343,20 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       hasRefreshToken: !!tokens.refresh_token,
       expiresIn: `${timeLeft} seconds`,
       expiresInValue: tokens.expires_in,
+      refreshExpiresInValue: refreshExpiresIn,
       issuedAt,
     })
 
-    // Persist tokens alongside our `issued_at` sibling. The SDK ignores extras
-    // when it re-validates via OAuthTokensSchema, but our `tokens()` reader
-    // pulls issued_at out separately via readRawJsonFile.
-    await writeJsonFile(this.serverUrlHash, 'tokens.json', { ...tokens, issued_at: issuedAt })
+    // Persist tokens alongside our sibling fields. The SDK ignores extras when
+    // it re-validates via OAuthTokensSchema; our `tokens()` reader pulls them
+    // out via readRawJsonFile. Spreading `tokens` keeps refresh_expires_in if
+    // the SDK didn't strip it before us; the explicit field below ensures it
+    // ends up on disk even if the spread doesn't carry it.
+    const onDisk: Record<string, unknown> = { ...tokens, issued_at: issuedAt }
+    if (refreshExpiresIn !== undefined) {
+      onDisk.refresh_expires_in = refreshExpiresIn
+    }
+    await writeJsonFile(this.serverUrlHash, 'tokens.json', onDisk)
   }
 
   /**

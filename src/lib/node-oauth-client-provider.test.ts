@@ -324,6 +324,133 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
     })
   })
 
+  describe('refresh_expires_in capture', () => {
+    it('persists refresh_expires_in when the server provided it', async () => {
+      provider = new NodeOAuthClientProvider(defaultOptions)
+      await provider.saveTokens({
+        access_token: 'a',
+        token_type: 'Bearer',
+        expires_in: 3600,
+        refresh_token: 'r',
+        refresh_expires_in: 7 * 24 * 3600, // 1 week
+      } as any)
+
+      expect(mockWriteJsonFile).toHaveBeenCalledWith(
+        'test-hash',
+        'tokens.json',
+        expect.objectContaining({
+          refresh_expires_in: 7 * 24 * 3600,
+          issued_at: expect.any(Number),
+        }),
+      )
+    })
+
+    it('omits refresh_expires_in on disk when the server did not provide it', async () => {
+      provider = new NodeOAuthClientProvider(defaultOptions)
+      await provider.saveTokens({
+        access_token: 'a',
+        token_type: 'Bearer',
+        expires_in: 3600,
+        refresh_token: 'r',
+      } as any)
+
+      const written = mockWriteJsonFile.mock.calls[0][2]
+      expect(written.refresh_expires_in).toBeUndefined()
+    })
+
+    it('logs refresh-token lifetime when refresh_expires_in is provided', async () => {
+      const logSpy = vi.mocked(utils.log)
+      logSpy.mockClear()
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      await provider.saveTokens({
+        access_token: 'a',
+        token_type: 'Bearer',
+        expires_in: 3600,
+        refresh_token: 'r',
+        refresh_expires_in: 86_400, // 1 day
+      } as any)
+
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('Refresh token valid for 1.0d'))
+    })
+
+    it('notes the unknown-lifetime case when refresh_expires_in is missing', async () => {
+      const logSpy = vi.mocked(utils.log)
+      logSpy.mockClear()
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      await provider.saveTokens({
+        access_token: 'a',
+        token_type: 'Bearer',
+        expires_in: 3600,
+        refresh_token: 'r',
+      } as any)
+
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('server did not provide refresh_expires_in'))
+    })
+
+    it('computes refresh token remaining seconds from issued_at + refresh_expires_in', async () => {
+      const persistedAt = Date.now() - 600_000 // 10 minutes ago
+      mockReadRawJsonFile.mockResolvedValue({
+        access_token: 'a',
+        token_type: 'Bearer',
+        expires_in: 3600,
+        refresh_token: 'r',
+        refresh_expires_in: 86_400,
+        issued_at: persistedAt,
+      })
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      const remaining = await provider.refreshTokenRemainingSeconds()
+      // ~ (86400 - 600) seconds, allow fudge
+      expect(remaining).toBeGreaterThan(86_400 - 600 - 5)
+      expect(remaining).toBeLessThanOrEqual(86_400 - 600)
+    })
+
+    it('returns undefined remaining when refresh_expires_in is missing', async () => {
+      mockReadRawJsonFile.mockResolvedValue({
+        access_token: 'a',
+        token_type: 'Bearer',
+        expires_in: 3600,
+        refresh_token: 'r',
+        issued_at: Date.now() - 1000,
+      })
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      const remaining = await provider.refreshTokenRemainingSeconds()
+      expect(remaining).toBeUndefined()
+    })
+
+    it('returns undefined remaining when there is no refresh token at all', async () => {
+      mockReadRawJsonFile.mockResolvedValue({
+        access_token: 'a',
+        token_type: 'Bearer',
+        expires_in: 3600,
+        refresh_expires_in: 86_400,
+        issued_at: Date.now() - 1000,
+      })
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      const remaining = await provider.refreshTokenRemainingSeconds()
+      expect(remaining).toBeUndefined()
+    })
+
+    it('clamps refresh remaining to 0 when past expiry', async () => {
+      mockReadRawJsonFile.mockResolvedValue({
+        access_token: 'a',
+        token_type: 'Bearer',
+        expires_in: 3600,
+        refresh_token: 'r',
+        refresh_expires_in: 60,
+        issued_at: Date.now() - 3600_000, // 1h ago, refresh only valid 60s
+      })
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      const remaining = await provider.refreshTokenRemainingSeconds()
+      expect(remaining).toBe(0)
+    })
+  })
+
   describe('credential invalidation', () => {
     it('should reset to default scopes after client invalidation', async () => {
       provider = new NodeOAuthClientProvider(defaultOptions)

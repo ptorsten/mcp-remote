@@ -229,19 +229,21 @@ Each unique combination of server URL, resource, and custom headers will maintai
 
   **In-process re-auth.** If the remote MCP server reports `401 Unauthorized` mid-session, `mcp-remote` does not exit. It closes the dead transport, resets the OAuth coordinator, and reconnects via `connectToRemoteServer`. The SDK first attempts a **silent refresh-token exchange** with the stored `refresh_token` — when that succeeds (the usual case), no browser opens and the hooks do *not* fire. Only if the refresh itself fails does the full OAuth flow run again, which re-fires `--pre-listen-hook` (new listener + fresh `once` listener for the post-auth hook) and `--post-auth-hook`. The new remote transport is swapped into the proxy without closing the stdio pipe, so your MCP client stays connected. In-flight requests on the dead transport are lost; the client is expected to retry them on its own.
 
-  **Token expiry logging.** Every time tokens are saved — after the initial OAuth flow, after a silent refresh, and after a mid-session re-auth — `mcp-remote` logs the access-token lifetime and the absolute expiry timestamp, e.g.:
+  **Token expiry logging.** Every time tokens are saved — after the initial OAuth flow, after a silent refresh, and after a mid-session re-auth — `mcp-remote` logs the access-token lifetime, the absolute expiry timestamp, and the refresh-token lifetime when the server provided one (via the `refresh_expires_in` vendor extension that Keycloak/Cognito/some others include):
 
   ```
-  OAuth tokens saved. Access token expires in 1.0h (at 5/30/2026, 6:42:11 PM). Refresh token: present.
+  OAuth tokens saved. Access token expires in 1.0h (at 5/30/2026, 6:42:11 PM). Refresh token valid for 30.0d (until 6/29/2026, 5:42:11 PM).
   ```
+
+  When the server doesn't return `refresh_expires_in`, the line ends with `Refresh token: present (server did not provide refresh_expires_in; lifetime unknown until it fails)` — most providers don't advertise refresh-token expiry, so you only find out the refresh token died when the next refresh attempt fails. RFC 6749 doesn't mandate this field.
 
   On startup, `mcp-remote` also logs what's already on disk so you can tell whether a silent refresh path is possible without enabling `--debug`:
 
   ```
-  Existing OAuth tokens loaded for https://example.remote/sse — 47m remaining, refresh token present (silent refresh will be attempted if needed).
+  Existing OAuth tokens loaded for https://example.remote/sse — 47m remaining, refresh token valid for 29.4d (silent refresh will be attempted if needed).
   ```
 
-  Remaining lifetime is computed from a sibling `issued_at` timestamp that `mcp-remote` writes alongside the OAuth fields in `tokens.json`. Tokens saved by older `mcp-remote` releases (no `issued_at` field) will show "remaining lifetime unknown" until they're next refreshed. Tokens are never wiped at startup — a restart always tries the existing access token first, then a silent refresh-token exchange, before falling through to the browser-based OAuth flow.
+  Remaining lifetimes are computed from a sibling `issued_at` timestamp that `mcp-remote` writes alongside the OAuth fields in `tokens.json`. Tokens saved by older `mcp-remote` releases (no `issued_at` field) will show "remaining lifetime unknown" until they're next refreshed. Tokens are never wiped at startup — a restart always tries the existing access token first, then a silent refresh-token exchange, before falling through to the browser-based OAuth flow.
 
   Run with `--debug` for the full token payload in `~/.mcp-auth/<hash>_debug.log`.
 
