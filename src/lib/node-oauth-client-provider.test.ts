@@ -435,6 +435,63 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       expect(remaining).toBeUndefined()
     })
 
+    it('debug log is deduped on repeat tokens() calls with unchanged state', async () => {
+      const debugLogSpy = vi.mocked(utils.debugLog)
+      debugLogSpy.mockClear()
+
+      mockReadRawJsonFile.mockResolvedValue({
+        access_token: 'a',
+        token_type: 'Bearer',
+        expires_in: 3600,
+        refresh_token: 'r',
+        issued_at: Date.now() - 1000,
+      })
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      // First call — should emit "Reading OAuth tokens", stack trace, and Token result
+      await provider.tokens()
+      const firstCallCount = debugLogSpy.mock.calls.length
+      expect(debugLogSpy).toHaveBeenCalledWith(expect.stringContaining('Reading OAuth tokens'))
+      expect(debugLogSpy).toHaveBeenCalledWith('Token result:', expect.anything())
+
+      // Second call with identical state — should NOT add more "Reading OAuth tokens" / "Token result" log entries
+      debugLogSpy.mockClear()
+      await provider.tokens()
+      expect(debugLogSpy).not.toHaveBeenCalledWith(expect.stringContaining('Reading OAuth tokens'))
+      expect(debugLogSpy).not.toHaveBeenCalledWith('Token result:', expect.anything())
+      // Sanity: prior call count was non-trivial so we know the comparison is meaningful
+      expect(firstCallCount).toBeGreaterThan(0)
+    })
+
+    it('re-emits the debug log when token state changes between reads', async () => {
+      const debugLogSpy = vi.mocked(utils.debugLog)
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      // First read
+      mockReadRawJsonFile.mockResolvedValueOnce({
+        access_token: 'a',
+        token_type: 'Bearer',
+        expires_in: 3600,
+        refresh_token: 'r',
+        issued_at: 1_000_000,
+      })
+      await provider.tokens()
+
+      // Second read with the same shape but a different issued_at (simulates a refresh)
+      debugLogSpy.mockClear()
+      mockReadRawJsonFile.mockResolvedValueOnce({
+        access_token: 'a',
+        token_type: 'Bearer',
+        expires_in: 3600,
+        refresh_token: 'r',
+        issued_at: 2_000_000,
+      })
+      await provider.tokens()
+
+      expect(debugLogSpy).toHaveBeenCalledWith(expect.stringContaining('Reading OAuth tokens'))
+      expect(debugLogSpy).toHaveBeenCalledWith('Token result:', expect.anything())
+    })
+
     it('clamps refresh remaining to 0 when past expiry', async () => {
       mockReadRawJsonFile.mockResolvedValue({
         access_token: 'a',
