@@ -1311,14 +1311,16 @@ describe('Feature: MCP Proxy', () => {
         heartbeatIntervalMs: 30_000,
       })
 
-      // Advance past two intervals — expect two pings.
-      vi.advanceTimersByTime(31_000)
+      // Advance past two intervals — expect two pings. Use the async variant so
+      // the serialized send chain's microtasks flush between fires (as they do
+      // between real 30s-apart heartbeats).
+      await vi.advanceTimersByTimeAsync(31_000)
       expect(mockTransportToServer.send).toHaveBeenCalledTimes(1)
       expect(mockTransportToServer.send).toHaveBeenCalledWith(
         expect.objectContaining({ method: 'ping', jsonrpc: '2.0', id: expect.stringMatching(/^mcp-remote-heartbeat-/) }),
       )
 
-      vi.advanceTimersByTime(30_000)
+      await vi.advanceTimersByTimeAsync(30_000)
       expect(mockTransportToServer.send).toHaveBeenCalledTimes(2)
     } finally {
       vi.useRealTimers()

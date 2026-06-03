@@ -285,6 +285,30 @@ export function mcpProxy({
   let heartbeatSeq = 0
   let heartbeatTimer: NodeJS.Timeout | undefined
 
+  // Single-flight sends to the remote transport. A 401 inside transport.send()
+  // drives the SDK's token refresh + retry within that send's own promise. If
+  // two sends (e.g. a user request and the heartbeat) hit a 401 at the same
+  // moment they each run a refresh; with refresh-token rotation (Notion et al.)
+  // the second exchange reuses a token the first already rotated away, poisoning
+  // the persisted refresh token and breaking auth until a manual re-login.
+  // Serializing makes a second send wait for the in-flight one and reuse the
+  // freshly-refreshed token. send() resolves after the POST round-trip (JSON-RPC
+  // results stream back asynchronously via onmessage), so this does NOT
+  // serialize tool execution — only the cheap submissions. When idle the send is
+  // dispatched synchronously, so timing matches an unwrapped transport.send().
+  let sendChain: Promise<unknown> | null = null
+  const sendToServer = (...args: Parameters<typeof transportToServer.send>): Promise<void> => {
+    const dispatch = () => transportToServer.send(...args)
+    const result = sendChain ? sendChain.then(dispatch) : dispatch()
+    const link = Promise.resolve(result).catch(() => {})
+    sendChain = link
+    // Drop back to the idle (synchronous) fast-path once the queue drains.
+    void link.then(() => {
+      if (sendChain === link) sendChain = null
+    })
+    return result
+  }
+
   const messageTransformer = createMessageTransformer({
     transformRequestFunction: (request: Message) => {
       // Block tools/call for ignored tools
@@ -346,7 +370,7 @@ export function mcpProxy({
       debugLog('Initialize message with modified client info', { clientInfo })
     }
 
-    transportToServer.send(message).catch(onServerError)
+    sendToServer(message).catch(onServerError)
   }
 
   transportToServer.onmessage = (_message) => {
@@ -444,7 +468,7 @@ export function mcpProxy({
     debugLog('Heartbeat ping sent', { id })
     // Route send failures through onServerError so a heartbeat-detected
     // UnauthorizedError trips the same recovery path as user-triggered errors.
-    transportToServer.send(ping).catch((error) => {
+    sendToServer(ping).catch((error) => {
       heartbeatIds.delete(id)
       onServerError(error)
     })
