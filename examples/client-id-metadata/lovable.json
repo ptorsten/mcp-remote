@@ -1,9 +1,0 @@
-{
-  "client_id": "https://cdn.jsdelivr.net/gh/ptorsten/mcp-remote@main/examples/client-id-metadata/lovable.json",
-  "client_name": "torsten (mcp-remote)",
-  "client_uri": "https://github.com/ptorsten/mcp-remote",
-  "redirect_uris": ["https://totte-dev.gpteng.dev/callback/lovable/oauth/callback"],
-  "grant_types": ["authorization_code", "refresh_token"],
-  "response_types": ["code"],
-  "token_endpoint_auth_method": "none"
-}
