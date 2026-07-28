@@ -55,6 +55,12 @@ export interface OAuthCallbackServerOptions {
   events: EventEmitter
   /** Timeout in milliseconds for the auth callback server's long poll */
   authTimeoutMs?: number
+  /**
+   * OAuth Client ID Metadata Document to serve from the callback listener
+   * (--client-id-metadata-document). The authorization server fetches this
+   * URL at authorization time in place of dynamic client registration.
+   */
+  clientIdMetadata?: { path: string; document: Record<string, unknown> }
 }
 
 // optional tatic OAuth client information

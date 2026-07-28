@@ -5,11 +5,14 @@ import express from 'express'
 import { AddressInfo } from 'net'
 import { unlinkSync } from 'fs'
 import { HookEnv, log, debugLog, runHook, setupOAuthCallbackServerWithLongPoll } from './utils'
+import { OAuthCallbackServerOptions } from './types'
 
 export interface CoordinationHooks {
   preListenHook?: string
   postAuthHook?: string
   env: HookEnv
+  /** Client ID Metadata Document served by the callback listener (--client-id-metadata-document) */
+  clientIdMetadata?: OAuthCallbackServerOptions['clientIdMetadata']
 }
 
 export type AuthCoordinator = {
@@ -289,6 +292,7 @@ export async function coordinateAuth(
     path: callbackPath,
     events,
     authTimeoutMs,
+    clientIdMetadata: hooks?.clientIdMetadata,
   })
 
   // Get the actual port the server is running on
