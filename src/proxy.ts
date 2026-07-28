@@ -47,15 +47,52 @@ async function runProxy(
   preListenHook: string | undefined,
   postAuthHook: string | undefined,
   heartbeatIntervalMs: number,
+  clientIdMetadataPath: string | undefined,
 ) {
   // Set up event emitter for auth flow
   const events = new EventEmitter()
+
+  // Client ID Metadata Document mode (--client-id-metadata-document): the
+  // callback listener hosts a document describing this client, and its public
+  // URL becomes our client_id — no dynamic client registration. For servers
+  // that restrict DCR but support the CIMD discovery flow (they fetch the
+  // document at authorization time and auto-register the client from it).
+  const redirectUri = new URL(`${callbackScheme}://${host}:${callbackPort}${callbackPath}`).toString()
+  const clientIdMetadataUrl = clientIdMetadataPath
+    ? new URL(`${callbackScheme}://${host}:${callbackPort}${clientIdMetadataPath}`).toString()
+    : undefined
+  const clientIdMetadata =
+    clientIdMetadataPath && clientIdMetadataUrl
+      ? {
+          path: clientIdMetadataPath,
+          document: {
+            client_id: clientIdMetadataUrl,
+            client_name: 'MCP CLI Proxy',
+            redirect_uris: [redirectUri],
+            grant_types: ['authorization_code', 'refresh_token'],
+            response_types: ['code'],
+            token_endpoint_auth_method: 'none',
+          },
+        }
+      : undefined
+  if (clientIdMetadataUrl) {
+    if (staticOAuthClientInfo) {
+      log('Warning: --client-id-metadata-document overrides --static-oauth-client-info')
+    }
+    staticOAuthClientInfo = {
+      client_id: clientIdMetadataUrl,
+      redirect_uris: [redirectUri],
+      token_endpoint_auth_method: 'none',
+    }
+    log(`Using client-id metadata document URL as client_id: ${clientIdMetadataUrl}`)
+  }
 
   // Create a lazy auth coordinator
   const authCoordinator = createLazyAuthCoordinator(serverUrlHash, port, events, authTimeoutMs, callbackPath, {
     preListenHook,
     postAuthHook,
-    env: { listenPort: port, callbackPort, host, scheme: callbackScheme, callbackPath },
+    env: { listenPort: port, callbackPort, host, scheme: callbackScheme, callbackPath, clientIdMetadataPath },
+    clientIdMetadata,
   })
 
   // Discover OAuth server info via Protected Resource Metadata (RFC 9728)
@@ -261,6 +298,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx proxy.ts <https://se
       preListenHook,
       postAuthHook,
       heartbeatIntervalMs,
+      clientIdMetadataPath,
     }) => {
       return runProxy(
         serverUrl,
@@ -280,6 +318,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx proxy.ts <https://se
         preListenHook,
         postAuthHook,
         heartbeatIntervalMs,
+        clientIdMetadataPath,
       )
     },
   )

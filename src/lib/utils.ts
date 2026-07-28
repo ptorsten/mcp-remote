@@ -107,6 +107,8 @@ export interface HookEnv {
   scheme: 'http' | 'https'
   /** Full path of the OAuth callback endpoint */
   callbackPath: string
+  /** Path of the hosted client-id metadata document (when --client-id-metadata-document is on) */
+  clientIdMetadataPath?: string
 }
 
 export type HookPhase = 'pre-listen' | 'post-auth'
@@ -121,6 +123,7 @@ function buildHookEnv(phase: HookPhase, env: HookEnv): Record<string, string> {
     MCP_REMOTE_CALLBACK_SCHEME: env.scheme,
     MCP_REMOTE_CALLBACK_PATH: env.callbackPath,
     MCP_REMOTE_CALLBACK_REDIRECT_URI: redirectUri,
+    ...(env.clientIdMetadataPath ? { MCP_REMOTE_CLIENT_METADATA_PATH: env.clientIdMetadataPath } : {}),
   }
 }
 
@@ -876,6 +879,16 @@ export function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbackServe
     options.events.emit('auth-code-received', code)
   })
 
+  // Serve the OAuth Client ID Metadata Document (when enabled): the
+  // authorization server fetches this URL at authorization time to discover
+  // the client's redirect URIs, in place of dynamic client registration.
+  if (options.clientIdMetadata) {
+    const { path: metadataPath, document } = options.clientIdMetadata
+    app.get(metadataPath, (_req, res) => {
+      res.type('application/json').send(JSON.stringify(document))
+    })
+  }
+
   const server = app.listen(options.port, '127.0.0.1', () => {
     log(`OAuth callback server running at http://127.0.0.1:${options.port}`)
   })
@@ -1062,6 +1075,17 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     }
   }
   const callbackPath = `${callbackPathPrefix}/oauth/callback`
+
+  // --client-id-metadata-document: host an OAuth Client ID Metadata Document
+  // (draft-ietf-oauth-client-id-metadata-document) on the callback listener
+  // and use its public URL as the client_id. For authorization servers that
+  // restrict dynamic client registration but advertise
+  // `client_id_metadata_document_supported: true` — they fetch the document at
+  // authorization time and auto-register the client from it.
+  const clientIdMetadataPath = args.includes('--client-id-metadata-document') ? `${callbackPathPrefix}/client-id-metadata.json` : undefined
+  if (clientIdMetadataPath) {
+    log(`Hosting client-id metadata document at: ${clientIdMetadataPath}`)
+  }
 
   // Check for debug flag
   const debug = args.includes('--debug')
@@ -1291,6 +1315,7 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     preListenHook,
     postAuthHook,
     heartbeatIntervalMs,
+    clientIdMetadataPath,
   }
 }
 

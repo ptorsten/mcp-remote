@@ -176,13 +176,21 @@ case "$ACTION" in
 
     resolve_caddy_server
 
+    # When mcp-remote hosts a client-id metadata document
+    # (--client-id-metadata-document), the OAuth server must be able to fetch
+    # it through the same public host — route that path to the listener too.
+    route_paths="[\"${MCP_REMOTE_CALLBACK_PATH}\"]"
+    if [[ -n "${MCP_REMOTE_CLIENT_METADATA_PATH:-}" ]]; then
+      route_paths="[\"${MCP_REMOTE_CALLBACK_PATH}\", \"${MCP_REMOTE_CLIENT_METADATA_PATH}\"]"
+    fi
+
     # Build our route. @id lets us delete it cleanly via /id/<id> later.
     payload=$(cat <<EOF
 {
   "@id": "${ROUTE_ID}",
   "match": [{
     "host": ["${MCP_REMOTE_CALLBACK_HOST}"],
-    "path": ["${MCP_REMOTE_CALLBACK_PATH}"]
+    "path": ${route_paths}
   }],
   "handle": [{
     "handler": "reverse_proxy",
