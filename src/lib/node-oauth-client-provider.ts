@@ -73,7 +73,32 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     this.authorizationServerMetadata = options.authorizationServerMetadata
     this.protectedResourceMetadata = options.protectedResourceMetadata
     this.wwwAuthenticateScope = options.wwwAuthenticateScope
+
+    // When the operator pins --resource, it is authoritative. The SDK's
+    // default check compares the WWW-Authenticate resource_metadata document
+    // against the server URL and hard-fails on mismatch — but some servers
+    // advertise a SIBLING surface's metadata (observed: api.lovable.dev/mcp
+    // pointing at mcp.lovable.dev's document), and RFC 8707 audiences may
+    // legitimately be the origin rather than the full URL. Defining the
+    // provider hook bypasses that check AND makes the pinned value the
+    // `resource` parameter on authorize, token exchange, and refresh alike.
+    // Left undefined when --resource is not given, preserving SDK defaults.
+    if (options.authorizeResource) {
+      const pinned = options.authorizeResource
+      this.validateResourceURL = async (_serverUrl: string | URL, resource?: string) => {
+        if (resource && resource !== pinned) {
+          debugLog('Resource metadata differs from pinned --resource; using pinned value', {
+            metadataResource: resource,
+            pinnedResource: pinned,
+          })
+        }
+        return new URL(pinned)
+      }
+    }
   }
+
+  /** Set only when --resource is pinned; consulted by the SDK's selectResourceURL. */
+  validateResourceURL?: (serverUrl: string | URL, resource?: string) => Promise<URL | undefined>
 
   get redirectUrl(): string {
     // Use URL to normalize away the default port (443 for https, 80 for http)
