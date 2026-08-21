@@ -611,6 +611,35 @@ export type AuthInitializer = () => Promise<{
 }>
 
 /**
+ * Copies OAuth discovery state captured during the initial 401 from the one-off HTTP probe
+ * transport onto the transport that will run finishAuth.
+ *
+ * In the null-client connect path, the 401 response — and with it the WWW-Authenticate
+ * `resource_metadata` URL and `scope` — lands on the probe transport only. Without adopting
+ * that state, finishAuth re-discovers from scratch against the resource host's standard
+ * well-known paths; on hosts that intercept /.well-known/* and /token (e.g. apps behind an
+ * auth wall that redirects non-browser clients), that discovery silently fails and the SDK
+ * falls back to exchanging the authorization code against `<resource-host>/token` — the
+ * wrong server.
+ *
+ * Reaches into the SDK transports' private `_resourceMetadataUrl`/`_scope` fields, which the
+ * SDK does not (yet) expose publicly.
+ *
+ * @param transport The transport finishAuth will be called on
+ * @param probeTransport The one-off probe transport that may have received the 401, if any
+ * @returns true when the resource metadata URL was copied over
+ */
+export function adoptProbeAuthDiscovery(transport: Transport, probeTransport: Transport | null): boolean {
+  if (!probeTransport) return false
+  const probed = probeTransport as { _resourceMetadataUrl?: URL; _scope?: string }
+  const main = transport as { _resourceMetadataUrl?: URL; _scope?: string }
+  if (!probed._resourceMetadataUrl || main._resourceMetadataUrl) return false
+  main._resourceMetadataUrl = probed._resourceMetadataUrl
+  if (probed._scope && !main._scope) main._scope = probed._scope
+  return true
+}
+
+/**
  * Creates and connects to a remote server with OAuth authentication
  * @param client The client to connect with
  * @param serverUrl The URL of the remote server
@@ -670,6 +699,11 @@ export async function connectToRemoteServer(
         requestInit: { headers },
       })
 
+  // In the null-client path the 401 (and its WWW-Authenticate resource_metadata URL) lands on the
+  // one-off probe transport, not `transport` — finishAuth on `transport` would then re-discover from
+  // scratch and can end up exchanging the code against the resource host instead of the real AS.
+  let probeTransport: StreamableHTTPClientTransport | null = null
+
   try {
     debugLog('Attempting to connect to remote server', { sseTransport })
 
@@ -685,9 +719,9 @@ export async function connectToRemoteServer(
         // the client is already connected. So let's just create a one-off client to make a single request and figure
         // out if we're actually talking to an HTTP server or not.
         debugLog('Creating test transport for HTTP-only connection test')
-        const testTransport = new StreamableHTTPClientTransport(url, { authProvider, requestInit: { headers } })
+        probeTransport = new StreamableHTTPClientTransport(url, { authProvider, requestInit: { headers } })
         const testClient = new Client({ name: 'mcp-remote-fallback-test', version: '0.0.0' }, { capabilities: {} })
-        await testClient.connect(testTransport)
+        await testClient.connect(probeTransport)
       }
     }
     log(`Connected to remote server using ${transport.constructor.name}`)
@@ -758,6 +792,9 @@ export async function connectToRemoteServer(
 
       try {
         log('Completing authorization...')
+        if (adoptProbeAuthDiscovery(transport, probeTransport)) {
+          debugLog('Copied resource metadata URL from probe transport for finishAuth')
+        }
         await transport.finishAuth(code)
         debugLog('Authorization completed successfully')
 
