@@ -1,5 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { parseCommandLineArgs, runHook, shouldIncludeTool, mcpProxy, setupOAuthCallbackServerWithLongPoll, getServerUrlHash } from './utils'
+import {
+  parseCommandLineArgs,
+  runHook,
+  shouldIncludeTool,
+  mcpProxy,
+  setupOAuthCallbackServerWithLongPoll,
+  getServerUrlHash,
+  adoptProbeAuthDiscovery,
+} from './utils'
 import { mkdtempSync, rmSync, readFileSync, existsSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
@@ -1670,5 +1678,68 @@ describe('Feature: Server URL Hash Generation', () => {
     const hash1 = getServerUrlHash('https://example.com', '')
     const hash2 = getServerUrlHash('https://example.com')
     expect(hash1).toBe(hash2)
+  })
+})
+
+describe('Feature: Adopting probe transport auth discovery for finishAuth', () => {
+  const makeTransport = (state: { _resourceMetadataUrl?: URL; _scope?: string } = {}) => state as unknown as Transport
+
+  it('Scenario: Copy resource metadata URL and scope captured by the probe transport', () => {
+    // Given a probe transport that received the 401 WWW-Authenticate discovery state
+    const probe = makeTransport({
+      _resourceMetadataUrl: new URL('https://rs.example.com/api/.well-known/oauth-protected-resource'),
+      _scope: 'openid email',
+    })
+    // And a main transport that never saw the 401
+    const main = makeTransport()
+
+    // When adopting the probe transport's discovery state
+    const adopted = adoptProbeAuthDiscovery(main, probe)
+
+    // Then the resource metadata URL and scope are copied onto the main transport
+    expect(adopted).toBe(true)
+    expect((main as any)._resourceMetadataUrl.href).toBe('https://rs.example.com/api/.well-known/oauth-protected-resource')
+    expect((main as any)._scope).toBe('openid email')
+  })
+
+  it('Scenario: Never overwrite discovery state the main transport captured itself', () => {
+    // Given both transports captured (different) discovery state
+    const probe = makeTransport({ _resourceMetadataUrl: new URL('https://probe.example.com/prm'), _scope: 'probe-scope' })
+    const main = makeTransport({ _resourceMetadataUrl: new URL('https://main.example.com/prm'), _scope: 'main-scope' })
+
+    // When adopting
+    const adopted = adoptProbeAuthDiscovery(main, probe)
+
+    // Then the main transport's own state is untouched
+    expect(adopted).toBe(false)
+    expect((main as any)._resourceMetadataUrl.href).toBe('https://main.example.com/prm')
+    expect((main as any)._scope).toBe('main-scope')
+  })
+
+  it('Scenario: Keep the main transport scope when only the URL is missing', () => {
+    // Given the main transport has a scope but no resource metadata URL
+    const probe = makeTransport({ _resourceMetadataUrl: new URL('https://probe.example.com/prm'), _scope: 'probe-scope' })
+    const main = makeTransport({ _scope: 'main-scope' })
+
+    // When adopting
+    const adopted = adoptProbeAuthDiscovery(main, probe)
+
+    // Then the URL is copied but the existing scope wins
+    expect(adopted).toBe(true)
+    expect((main as any)._resourceMetadataUrl.href).toBe('https://probe.example.com/prm')
+    expect((main as any)._scope).toBe('main-scope')
+  })
+
+  it('Scenario: No probe transport or no captured state is a no-op', () => {
+    // Given no probe transport at all
+    const main = makeTransport()
+    // Then adoption reports nothing to copy
+    expect(adoptProbeAuthDiscovery(main, null)).toBe(false)
+
+    // And given a probe transport that never received a 401
+    const emptyProbe = makeTransport()
+    // Then adoption still reports nothing to copy
+    expect(adoptProbeAuthDiscovery(main, emptyProbe)).toBe(false)
+    expect((main as any)._resourceMetadataUrl).toBeUndefined()
   })
 })
