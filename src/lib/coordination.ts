@@ -32,6 +32,9 @@ export type AuthCoordinator = {
  * @param pid The process ID to check
  * @returns True if the process is running, false otherwise
  */
+/** Consecutive unreachable polls tolerated before concluding the primary is gone. */
+export const MAX_CONSECUTIVE_POLL_FAILURES = 5
+
 export async function isPidRunning(pid: number): Promise<boolean> {
   try {
     process.kill(pid, 0) // Doesn't kill the process, just checks if it exists
@@ -93,15 +96,26 @@ export async function isLockValid(lockData: LockfileData): Promise<boolean> {
 }
 
 /**
- * Waits for authentication from another server instance
+ * Waits for authentication from another server instance.
+ *
+ * Only the pending path (202) polls indefinitely — a primary can legitimately
+ * sit waiting for a human to click an authorize link for many minutes. The
+ * ERROR path is bounded: if the primary's endpoint stops answering (process
+ * killed, port gone), returning false lets the caller take over as primary.
+ * Previously fetch errors retried forever, so a secondary that started
+ * polling a primary which then died span on connection-refused until killed.
+ *
  * @param port The port to connect to
+ * @param pid The primary's process id from the lockfile, when known — lets a
+ *            dead primary be detected on the first failed poll
  * @returns True if authentication completed successfully, false otherwise
  */
-export async function waitForAuthentication(port: number): Promise<boolean> {
+export async function waitForAuthentication(port: number, pid?: number): Promise<boolean> {
   log(`Waiting for authentication from the server on port ${port}...`)
 
   try {
     let attempts = 0
+    let consecutiveFailures = 0
     while (true) {
       attempts++
       const url = `http://127.0.0.1:${port}/wait-for-auth`
@@ -111,6 +125,7 @@ export async function waitForAuthentication(port: number): Promise<boolean> {
       try {
         const response = await fetch(url)
         debugLog(`Poll response status: ${response.status}`)
+        consecutiveFailures = 0
 
         if (response.status === 200) {
           // Auth completed, but we don't return the code anymore
@@ -126,7 +141,16 @@ export async function waitForAuthentication(port: number): Promise<boolean> {
           return false
         }
       } catch (fetchError) {
-        debugLog(`Fetch error during poll`, fetchError)
+        consecutiveFailures++
+        debugLog(`Fetch error during poll`, { consecutiveFailures, fetchError })
+        if (pid !== undefined && !(await isPidRunning(pid))) {
+          log(`Primary instance (pid ${pid}) is no longer running — taking over`)
+          return false
+        }
+        if (consecutiveFailures >= MAX_CONSECUTIVE_POLL_FAILURES) {
+          log(`Auth endpoint unreachable ${consecutiveFailures} times in a row — assuming the primary is gone`)
+          return false
+        }
         // If we can't connect, we'll try again after a delay
         await new Promise((resolve) => setTimeout(resolve, 2000))
       }
@@ -228,7 +252,7 @@ export async function coordinateAuth(
     try {
       // Try to wait for the authentication to complete
       debugLog('Waiting for authentication from other instance')
-      const authCompleted = await waitForAuthentication(lockData.port)
+      const authCompleted = await waitForAuthentication(lockData.port, lockData.pid)
 
       if (authCompleted) {
         log('Authentication completed by another instance. Using tokens from disk')
